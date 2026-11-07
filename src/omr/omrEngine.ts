@@ -112,8 +112,115 @@ export function computeHomography(dst: Point2D[], src: Point2D[]): number[] {
 }
 
 /**
- * Bradley-Roth fast O(W*H) integral-image local adaptive threshold.
- * Returns binary mask (1 = dark ink, 0 = light paper), grayscale array, and local background mean.
+ * Stretch compressed dynamic range (2nd..98th percentile -> 8..248) on warped paper regions
+ * so underexposed low-light or hazy photos regain crisp ink-vs-paper separation.
+ */
+export function normalizeIlluminationRgba(
+  rgba: Uint8ClampedArray,
+  width: number,
+  height: number
+): Uint8ClampedArray {
+  const total = width * height;
+  if (total === 0) return rgba;
+  const hist = new Uint32Array(256);
+  for (let i = 0, p = 0; i < total; i++, p += 4) {
+    const g = (rgba[p] * 77 + rgba[p + 1] * 150 + rgba[p + 2] * 29) >> 8;
+    hist[g]++;
+  }
+
+  const lowTarget = Math.floor(total * 0.015);
+  const highTarget = Math.floor(total * 0.985);
+  let pLow = 0;
+  let pHigh = 255;
+  let acc = 0;
+  for (let v = 0; v < 256; v++) {
+    acc += hist[v];
+    if (acc >= lowTarget) {
+      pLow = v;
+      break;
+    }
+  }
+  acc = 0;
+  for (let v = 0; v < 256; v++) {
+    acc += hist[v];
+    if (acc >= highTarget) {
+      pHigh = v;
+      break;
+    }
+  }
+
+  const span = pHigh - pLow;
+  // Already full-range or uniform blank frame
+  if (span < 18 || (pLow <= 28 && pHigh >= 215)) {
+    return rgba;
+  }
+
+  const out = new Uint8ClampedArray(rgba.length);
+  const scale = 240 / span;
+  for (let p = 0; p < rgba.length; p += 4) {
+    out[p] = Math.max(0, Math.min(255, Math.round((rgba[p] - pLow) * scale + 8)));
+    out[p + 1] = Math.max(0, Math.min(255, Math.round((rgba[p + 1] - pLow) * scale + 8)));
+    out[p + 2] = Math.max(0, Math.min(255, Math.round((rgba[p + 2] - pLow) * scale + 8)));
+    out[p + 3] = rgba[p + 3];
+  }
+  return out;
+}
+
+export interface FrameQualityReport {
+  brightness: number;
+  sharpness: number;
+  lowLight: boolean;
+  blurry: boolean;
+}
+
+/**
+ * Fast O(W*H/4) live camera frame diagnostics for ambient light & motion blur.
+ */
+export function assessFrameQuality(
+  gray: Uint8Array,
+  width: number,
+  height: number
+): FrameQualityReport {
+  if (width < 8 || height < 8) {
+    return { brightness: 128, sharpness: 20, lowLight: false, blurry: false };
+  }
+  let lumSum = 0;
+  let lapSum = 0;
+  let count = 0;
+
+  // Measure central 70% region where the answer sheet sits
+  const x0 = Math.max(2, Math.floor(width * 0.15));
+  const x1 = Math.min(width - 3, Math.ceil(width * 0.85));
+  const y0 = Math.max(2, Math.floor(height * 0.15));
+  const y1 = Math.min(height - 3, Math.ceil(height * 0.85));
+
+  for (let y = y0; y <= y1; y += 2) {
+    const rowOff = y * width;
+    for (let x = x0; x <= x1; x += 2) {
+      const idx = rowOff + x;
+      const c = gray[idx];
+      lumSum += c;
+      const lap = Math.abs(
+        4 * c - gray[idx - 1] - gray[idx + 1] - gray[idx - width] - gray[idx + width]
+      );
+      lapSum += lap;
+      count++;
+    }
+  }
+
+  const brightness = count > 0 ? Math.round(lumSum / count) : 128;
+  const sharpness = count > 0 ? Number((lapSum / count).toFixed(2)) : 20;
+  return {
+    brightness,
+    sharpness,
+    lowLight: brightness < 78,
+    blurry: sharpness < 7.5,
+  };
+}
+
+/**
+ * Bradley-Roth fast O(W*H) integral-image local adaptive threshold with O(1) 3x3 high-ISO denoising.
+ * Returns binary mask (1 = dark ink, 0 = light paper), denoised grayscale array, and local background mean.
  */
 export function adaptiveThresholdImage(
   rgba: Uint8ClampedArray,
@@ -122,9 +229,9 @@ export function adaptiveThresholdImage(
   sensitivity = 0.84,
   windowDivisor = 28
 ): { gray: Uint8Array; binary: Uint8Array; localMean: Uint8Array } {
-  const gray = new Uint8Array(width * height);
-  for (let i = 0, p = 0; i < gray.length; i++, p += 4) {
-    gray[i] = (rgba[p] * 77 + rgba[p + 1] * 150 + rgba[p + 2] * 29) >> 8;
+  const rawGray = new Uint8Array(width * height);
+  for (let i = 0, p = 0; i < rawGray.length; i++, p += 4) {
+    rawGray[i] = (rgba[p] * 77 + rgba[p + 1] * 150 + rgba[p + 2] * 29) >> 8;
   }
 
   const integral = new Float64Array((width + 1) * (height + 1));
@@ -135,11 +242,12 @@ export function adaptiveThresholdImage(
     const dstOff = y * stride;
     const prevOff = (y - 1) * stride;
     for (let x = 1; x <= width; x++) {
-      rowSum += gray[srcOff + x - 1];
+      rowSum += rawGray[srcOff + x - 1];
       integral[dstOff + x] = integral[prevOff + x] + rowSum;
     }
   }
 
+  const gray = new Uint8Array(width * height);
   const binary = new Uint8Array(width * height);
   const localMean = new Uint8Array(width * height);
   const s2 = Math.max(8, Math.round(Math.min(width, height) / windowDivisor));
@@ -147,6 +255,8 @@ export function adaptiveThresholdImage(
   for (let y = 0; y < height; y++) {
     const y1 = Math.max(0, y - s2);
     const y2 = Math.min(height - 1, y + s2);
+    const ny1 = Math.max(0, y - 1);
+    const ny2 = Math.min(height - 1, y + 1);
     for (let x = 0; x < width; x++) {
       const x1 = Math.max(0, x - s2);
       const x2 = Math.min(width - 1, x + s2);
@@ -157,9 +267,21 @@ export function adaptiveThresholdImage(
         integral[(y2 + 1) * stride + x1] +
         integral[y1 * stride + x1];
 
+      // 3x3 box denoise via integral table (suppresses high-ISO camera grain in low light)
+      const nx1 = Math.max(0, x - 1);
+      const nx2 = Math.min(width - 1, x + 1);
+      const nCount = (nx2 - nx1 + 1) * (ny2 - ny1 + 1);
+      const nSum =
+        integral[(ny2 + 1) * stride + (nx2 + 1)] -
+        integral[ny1 * stride + (nx2 + 1)] -
+        integral[(ny2 + 1) * stride + nx1] +
+        integral[ny1 * stride + nx1];
+      const denoised = nSum / nCount;
+
       const idx = y * width + x;
+      gray[idx] = Math.round(denoised);
       localMean[idx] = Math.round(sum / count);
-      binary[idx] = gray[idx] * count < sum * sensitivity ? 1 : 0;
+      binary[idx] = denoised * count < sum * sensitivity ? 1 : 0;
     }
   }
 
@@ -183,11 +305,34 @@ function extractSquareFiducials(
   const maxSide = minDim * 0.11;
   const qx = new Int32Array(width * height);
 
+  // Estimate 90th-percentile bright paper level so dim/shadowed rooms adapt darkCutoff automatically
+  let darkCutoff = 145;
+  if (gray && gray.length > 0) {
+    const hist = new Uint32Array(256);
+    const step = Math.max(1, Math.floor(gray.length / 16000));
+    let samples = 0;
+    for (let i = 0; i < gray.length; i += step) {
+      hist[gray[i]]++;
+      samples++;
+    }
+    const target90 = Math.floor(samples * 0.9);
+    let acc = 0;
+    let p90 = 200;
+    for (let v = 0; v < 256; v++) {
+      acc += hist[v];
+      if (acc >= target90) {
+        p90 = v;
+        break;
+      }
+    }
+    darkCutoff = Math.max(60, Math.min(165, Math.round(p90 * 0.68)));
+  }
+
   for (let y = 2; y < height - 2; y += 2) {
     for (let x = 2; x < width - 2; x += 2) {
       const startIdx = y * width + x;
       if (!binary[startIdx] || visited[startIdx]) continue;
-      if (gray && gray[startIdx] > 140) continue;
+      if (gray && gray[startIdx] > darkCutoff) continue;
 
       let head = 0;
       let tail = 0;
@@ -214,7 +359,12 @@ function extractSquareFiducials(
         if (py < minY) minY = py;
         if (py > maxY) maxY = py;
 
-        if (px > 0 && binary[idx - 1] && !visited[idx - 1] && (!gray || gray[idx - 1] <= 145)) {
+        if (
+          px > 0 &&
+          binary[idx - 1] &&
+          !visited[idx - 1] &&
+          (!gray || gray[idx - 1] <= darkCutoff + 6)
+        ) {
           visited[idx - 1] = 1;
           qx[tail++] = idx - 1;
         }
@@ -222,7 +372,7 @@ function extractSquareFiducials(
           px + 1 < width &&
           binary[idx + 1] &&
           !visited[idx + 1] &&
-          (!gray || gray[idx + 1] <= 145)
+          (!gray || gray[idx + 1] <= darkCutoff + 6)
         ) {
           visited[idx + 1] = 1;
           qx[tail++] = idx + 1;
@@ -231,7 +381,7 @@ function extractSquareFiducials(
           py > 0 &&
           binary[idx - width] &&
           !visited[idx - width] &&
-          (!gray || gray[idx - width] <= 145)
+          (!gray || gray[idx - width] <= darkCutoff + 6)
         ) {
           visited[idx - width] = 1;
           qx[tail++] = idx - width;
@@ -240,7 +390,7 @@ function extractSquareFiducials(
           py + 1 < height &&
           binary[idx + width] &&
           !visited[idx + width] &&
-          (!gray || gray[idx + width] <= 145)
+          (!gray || gray[idx + width] <= darkCutoff + 6)
         ) {
           visited[idx + width] = 1;
           qx[tail++] = idx + width;
@@ -283,8 +433,11 @@ function extractSquareFiducials(
         const innerMean = inCnt > 0 ? inSum / inCnt : 0;
         const surroundMean = outCnt > 0 ? outSum / outCnt : 255;
         contrast = surroundMean - innerMean;
-        // Reject dark keys on dark keyboards or low-contrast background shadows
-        if (innerMean > 108 || contrast < 58) continue;
+        // Relative Weber contrast: rejects dark keyboard keys on dark chassis while keeping shadowed paper fiducials
+        const minContrast = Math.max(20, surroundMean * 0.25);
+        if (surroundMean < 46 || contrast < minContrast || innerMean > surroundMean * 0.56) {
+          continue;
+        }
       }
 
       blobs.push({
@@ -490,14 +643,41 @@ function warpRgbaRegion(
   for (let y = 0; y < dstH; y++) {
     for (let x = 0; x < dstW; x++) {
       const denom = H[6] * x + H[7] * y + H[8];
-      const sx = Math.round((H[0] * x + H[1] * y + H[2]) / denom);
-      const sy = Math.round((H[3] * x + H[4] * y + H[5]) / denom);
+      const fx = (H[0] * x + H[1] * y + H[2]) / denom;
+      const fy = (H[3] * x + H[4] * y + H[5]) / denom;
       const dstIdx = (y * dstW + x) * 4;
-      if (sx >= 0 && sx < srcW && sy >= 0 && sy < srcH) {
-        const srcIdx = (sy * srcW + sx) * 4;
-        out[dstIdx] = srcData[srcIdx];
-        out[dstIdx + 1] = srcData[srcIdx + 1];
-        out[dstIdx + 2] = srcData[srcIdx + 2];
+      if (fx >= 0 && fx <= srcW - 1 && fy >= 0 && fy <= srcH - 1) {
+        const x0 = Math.floor(fx);
+        const y0 = Math.floor(fy);
+        const x1 = Math.min(srcW - 1, x0 + 1);
+        const y1 = Math.min(srcH - 1, y0 + 1);
+        const wx = fx - x0;
+        const wy = fy - y0;
+        const w00 = (1 - wx) * (1 - wy);
+        const w10 = wx * (1 - wy);
+        const w01 = (1 - wx) * wy;
+        const w11 = wx * wy;
+
+        const i00 = (y0 * srcW + x0) * 4;
+        const i10 = (y0 * srcW + x1) * 4;
+        const i01 = (y1 * srcW + x0) * 4;
+        const i11 = (y1 * srcW + x1) * 4;
+
+        out[dstIdx] = Math.round(
+          srcData[i00] * w00 + srcData[i10] * w10 + srcData[i01] * w01 + srcData[i11] * w11
+        );
+        out[dstIdx + 1] = Math.round(
+          srcData[i00 + 1] * w00 +
+            srcData[i10 + 1] * w10 +
+            srcData[i01 + 1] * w01 +
+            srcData[i11 + 1] * w11
+        );
+        out[dstIdx + 2] = Math.round(
+          srcData[i00 + 2] * w00 +
+            srcData[i10 + 2] * w10 +
+            srcData[i01 + 2] * w01 +
+            srcData[i11 + 2] * w11
+        );
         out[dstIdx + 3] = 255;
       } else {
         out[dstIdx] = 255;
@@ -519,24 +699,35 @@ function measureCircleFill(
   innerR: number
 ): number {
   const r2 = innerR * innerR;
-  const minX = Math.max(0, Math.floor(cx - innerR));
-  const maxX = Math.min(imgW - 1, Math.ceil(cx + innerR));
-  const minY = Math.max(0, Math.floor(cy - innerR));
-  const maxY = Math.min(imgH - 1, Math.ceil(cy + innerR));
+  const haloIn2 = innerR * 1.55 * (innerR * 1.55);
+  const haloOut = innerR * 2.05;
+  const haloOut2 = haloOut * haloOut;
+
+  const minX = Math.max(0, Math.floor(cx - haloOut));
+  const maxX = Math.min(imgW - 1, Math.ceil(cx + haloOut));
+  const minY = Math.max(0, Math.floor(cy - haloOut));
+  const maxY = Math.min(imgH - 1, Math.ceil(cy + haloOut));
 
   let darkPixels = 0;
   let totalPixels = 0;
   let graySum = 0;
   let localSum = 0;
+  let haloSum = 0;
+  let haloCnt = 0;
 
   for (let py = minY; py <= maxY; py++) {
+    const dy2 = (py - cy) * (py - cy);
     for (let px = minX; px <= maxX; px++) {
-      if ((px - cx) * (px - cx) + (py - cy) * (py - cy) <= r2) {
+      const d2 = (px - cx) * (px - cx) + dy2;
+      if (d2 <= r2) {
         totalPixels++;
         const idx = py * imgW + px;
         if (thresh.binary[idx]) darkPixels++;
         graySum += thresh.gray[idx];
         localSum += thresh.localMean[idx];
+      } else if (d2 >= haloIn2 && d2 <= haloOut2) {
+        haloSum += thresh.gray[py * imgW + px];
+        haloCnt++;
       }
     }
   }
@@ -544,22 +735,49 @@ function measureCircleFill(
   if (totalPixels === 0) return 0;
   const binRatio = darkPixels / totalPixels;
   const meanGray = graySum / totalPixels;
-  const meanLocal = Math.max(60, localSum / totalPixels);
-  const relDark = Math.max(0, Math.min(1, 1 - meanGray / meanLocal));
-  return binRatio * 0.65 + Math.min(1, relDark * 1.8) * 0.35;
+  const baseLocal = localSum / totalPixels;
+  // Blend immediate concentric paper halo with local window mean to cancel sharp shadow edges
+  const paperRef = Math.max(
+    45,
+    haloCnt >= 8 ? Math.max(baseLocal, haloSum / haloCnt) * 0.6 + baseLocal * 0.4 : baseLocal
+  );
+  const relDark = Math.max(0, Math.min(1, 1 - meanGray / paperRef));
+  return binRatio * 0.62 + Math.min(1, relDark * 1.85) * 0.38;
 }
 
 function pickMarkedChoice(
   items: Array<{ value: string; score: number }>,
   eraseMode: 'normal' | 'high',
-  minMarkThreshold = 0.35
+  minMarkThreshold = 0.33
 ): { value: string; multi: boolean } {
   const scored = [...items].sort((a, b) => b.score - a.score);
   if (scored.length === 0) return { value: '', multi: false };
   const top = scored[0];
   const second = scored[1] || { value: '', score: 0 };
 
+  // Compute unselected sibling baseline for faint-pencil & shadow-noise resilience
+  const rest = scored.slice(1);
+  const medianRest =
+    rest.length > 0 ? rest[Math.floor(rest.length / 2)].score : 0;
+
+  // Faint 2B/HB pencil rescue: clearly stands out above clean siblings in the same row/column
+  if (
+    top.score < minMarkThreshold &&
+    items.length >= 4 &&
+    top.score >= 0.21 &&
+    medianRest <= 0.12 &&
+    top.score - second.score >= 0.12 &&
+    top.score >= second.score * 1.85
+  ) {
+    return { value: top.value, multi: false };
+  }
+
   if (top.score < minMarkThreshold) {
+    return { value: '', multi: false };
+  }
+
+  // Reject uniform shadow/noise floor if every sibling bubble in the group is similarly dark
+  if (rest.length >= 2 && medianRest > 0.26 && top.score - medianRest < 0.11) {
     return { value: '', multi: false };
   }
 
@@ -621,8 +839,11 @@ function scanMinistryBgdSheet(
     [constellation.mL, constellation.mR, constellation.bR, constellation.bL]
   );
 
-  const idThresh = adaptiveThresholdImage(idRgba, ID_W, ID_H, 0.84, 24);
-  const bodyThresh = adaptiveThresholdImage(bodyRgba, BODY_W, BODY_H, 0.84, 24);
+  const normIdRgba = normalizeIlluminationRgba(idRgba, ID_W, ID_H);
+  const normBodyRgba = normalizeIlluminationRgba(bodyRgba, BODY_W, BODY_H);
+
+  const idThresh = adaptiveThresholdImage(normIdRgba, ID_W, ID_H, 0.84, 24);
+  const bodyThresh = adaptiveThresholdImage(normBodyRgba, BODY_W, BODY_H, 0.84, 24);
 
   const overlayBubbles: BubbleCoord[] = [];
   // Composite layout: top header 1000x364 + bottom body 1000x1050 = 1000x1414
@@ -971,17 +1192,31 @@ export function scanSheetFromImageData(
   overrideCorners?: CornerQuad
 ): ScanResult {
   const { width, height, data } = imageData;
-  const { binary, gray } = adaptiveThresholdImage(data, width, height, 0.80, 32);
+  let { binary, gray } = adaptiveThresholdImage(data, width, height, 0.80, 32);
 
   if (!overrideCorners && contest.formId === 'bgd_2025') {
-    const blobs = extractSquareFiducials(binary, gray, width, height);
-    const ministry = detectMinistryBgdConstellation(blobs, width);
+    let blobs = extractSquareFiducials(binary, gray, width, height);
+    let ministry = detectMinistryBgdConstellation(blobs, width);
+    // Low-contrast / washed-out lighting fallback pass
+    if (!ministry) {
+      const retry = adaptiveThresholdImage(data, width, height, 0.86, 28);
+      blobs = extractSquareFiducials(retry.binary, retry.gray, width, height);
+      ministry = detectMinistryBgdConstellation(blobs, width);
+      if (ministry) {
+        binary = retry.binary;
+        gray = retry.gray;
+      }
+    }
     if (ministry) {
       return scanMinistryBgdSheet(data, width, height, ministry, contest, keys, settings);
     }
   }
 
-  const detected = overrideCorners || detectFiducialCorners(binary, width, height, gray);
+  let detected = overrideCorners || detectFiducialCorners(binary, width, height, gray);
+  if (!detected && !overrideCorners) {
+    const retry = adaptiveThresholdImage(data, width, height, 0.86, 28);
+    detected = detectFiducialCorners(retry.binary, width, height, retry.gray);
+  }
   const corners: CornerQuad = detected || {
     tl: { x: width * 0.05, y: height * 0.035 },
     tr: { x: width * 0.95, y: height * 0.035 },
@@ -996,7 +1231,7 @@ export function scanSheetFromImageData(
     FIDUCIAL_CENTERS.bl,
   ];
   const srcPts = [corners.tl, corners.tr, corners.br, corners.bl];
-  const warpedData = warpRgbaRegion(
+  const rawWarpedData = warpRgbaRegion(
     data,
     width,
     height,
@@ -1005,6 +1240,7 @@ export function scanSheetFromImageData(
     dstPts,
     srcPts
   );
+  const warpedData = normalizeIlluminationRgba(rawWarpedData, CANONICAL_W, CANONICAL_H);
 
   const warpedThresh = adaptiveThresholdImage(warpedData, CANONICAL_W, CANONICAL_H, 0.83, 28);
   const geom = buildSheetGeometry(contest);

@@ -6,6 +6,7 @@ import {
   CameraOff,
   Check,
   Crop,
+  Flashlight,
   ImagePlus,
   Play,
   RefreshCw,
@@ -24,9 +25,10 @@ import {
 import { t } from '../i18n';
 import {
   adaptiveThresholdImage,
+  assessFrameQuality,
   CornerQuad,
   detectFiducialCorners,
-   ScanResult,
+  ScanResult,
   scanSheetFromImageData,
 } from '../omr/omrEngine';
 import { renderSheetToCanvas } from '../sheets/sheetLayouts';
@@ -65,6 +67,10 @@ export const ScannerPanel: React.FC<Props> = ({
   const [cameraStarting, setCameraStarting] = useState(false);
   const [needsManualPlayTap, setNeedsManualPlayTap] = useState(false);
   const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
+  const [torchSupported, setTorchSupported] = useState(false);
+  const [torchOn, setTorchOn] = useState(false);
+  const [lowLightWarn, setLowLightWarn] = useState(false);
+  const [blurWarn, setBlurWarn] = useState(false);
   const [cameraError, setCameraError] = useState<string>('');
   const [lockedCorners, setLockedCorners] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
@@ -97,6 +103,10 @@ export const ScannerPanel: React.FC<Props> = ({
     setCameraActive(false);
     setCameraStarting(false);
     setNeedsManualPlayTap(false);
+    setTorchSupported(false);
+    setTorchOn(false);
+    setLowLightWarn(false);
+    setBlurWarn(false);
     setLockedCorners(false);
     stableFramesRef.current = 0;
   };
@@ -270,6 +280,26 @@ export const ScannerPanel: React.FC<Props> = ({
         track.onended = () => {
           if (mountedRef.current) stopCamera();
         };
+        try {
+          const caps: any = (track as any).getCapabilities?.();
+          if (caps) {
+            if ('torch' in caps) {
+              setTorchSupported(true);
+            }
+            const adv: Record<string, any> = {};
+            if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
+              adv.focusMode = 'continuous';
+            }
+            if (Array.isArray(caps.exposureMode) && caps.exposureMode.includes('continuous')) {
+              adv.exposureMode = 'continuous';
+            }
+            if (Object.keys(adv).length > 0) {
+              track.applyConstraints({ advanced: [adv] } as any).catch(() => {});
+            }
+          }
+        } catch {
+          // Optional hardware capabilities check
+        }
       });
 
       streamRef.current = stream;
@@ -316,6 +346,18 @@ export const ScannerPanel: React.FC<Props> = ({
     startCamera(next);
   };
 
+  const handleToggleTorch = async () => {
+    const track = streamRef.current?.getVideoTracks()?.[0];
+    if (!track) return;
+    const next = !torchOn;
+    try {
+      await track.applyConstraints({ advanced: [{ torch: next } as any] });
+      setTorchOn(next);
+    } catch {
+      setTorchSupported(false);
+    }
+  };
+
   const handleManualPlayTap = () => {
     const vid = videoRef.current;
     if (!vid) return;
@@ -352,7 +394,15 @@ export const ScannerPanel: React.FC<Props> = ({
       wctx.drawImage(vid, 0, 0, pw, ph);
       const imgData = wctx.getImageData(0, 0, pw, ph);
       const { binary, gray } = adaptiveThresholdImage(imgData.data, pw, ph, 0.80, 32);
-      const quad = detectFiducialCorners(binary, pw, ph, gray);
+      const quality = assessFrameQuality(gray, pw, ph);
+      setLowLightWarn(quality.lowLight);
+      setBlurWarn(quality.blurry);
+
+      let quad = detectFiducialCorners(binary, pw, ph, gray);
+      if (!quad && quality.lowLight) {
+        const retry = adaptiveThresholdImage(imgData.data, pw, ph, 0.86, 28);
+        quad = detectFiducialCorners(retry.binary, pw, ph, retry.gray);
+      }
 
       // Draw viewfinder overlay
       if (overlayCanvasRef.current) {
@@ -380,7 +430,10 @@ export const ScannerPanel: React.FC<Props> = ({
 
       if (quad) {
         setLockedCorners(true);
-        stableFramesRef.current += 1;
+        // Only count sharp frames toward auto-capture so hand shake doesn't snap a blurry image
+        if (!quality.blurry) {
+          stableFramesRef.current += 1;
+        }
         const neededFrames =
           settings.autoCaptureDelayMs === 0
             ? 999999
@@ -658,10 +711,18 @@ export const ScannerPanel: React.FC<Props> = ({
               {!cameraStarting && !needsManualPlayTap && (
                 <div className={`corner-pill ${lockedCorners ? 'locked' : ''}`}>
                   {lockedCorners
-                    ? lang === 'vi'
-                      ? '✓ Đã khóa 4 góc phiếu — giữ yên...'
-                      : '✓ 4 corners locked — hold steady...'
-                    : tr.scan.alignHint}
+                    ? blurWarn
+                      ? lang === 'vi'
+                        ? '✓ Đã thấy 4 góc — giữ chắc tay để lấy nét...'
+                        : '✓ 4 corners found — hold steady to focus...'
+                      : lang === 'vi'
+                        ? '✓ Đã khóa 4 góc nét — giữ yên...'
+                        : '✓ 4 corners locked sharp — hold steady...'
+                    : lowLightWarn
+                      ? lang === 'vi'
+                        ? '⚠ Hơi thiếu sáng — bật Đèn hoặc nghiêng tránh bóng râm'
+                        : '⚠ Low light — turn on Torch or avoid shadows'
+                      : tr.scan.alignHint}
                 </div>
               )}
             </div>
@@ -670,9 +731,25 @@ export const ScannerPanel: React.FC<Props> = ({
               <button type="button" className="secondary-btn" onClick={stopCamera}>
                 <CameraOff size={16} /> {tr.scan.stopCamera}
               </button>
-              <button type="button" className="secondary-btn" onClick={handleFlipCamera}>
-                <RefreshCw size={16} /> {tr.scan.switchCamera}
-              </button>
+              <div style={{ display: 'flex', gap: 6 }}>
+                {torchSupported && (
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    style={
+                      torchOn
+                        ? { background: '#f59e0b', color: '#fff', borderColor: '#f59e0b' }
+                        : undefined
+                    }
+                    onClick={handleToggleTorch}
+                  >
+                    <Flashlight size={16} /> {lang === 'vi' ? 'Đèn' : 'Torch'}
+                  </button>
+                )}
+                <button type="button" className="secondary-btn" onClick={handleFlipCamera}>
+                  <RefreshCw size={16} /> {tr.scan.switchCamera}
+                </button>
+              </div>
               <button
                 type="button"
                 className="primary-btn"

@@ -286,5 +286,52 @@ describe.runIf(hasRealData)('Real-World Vietnamese Exam Data Integration (real_d
     );
     expect(missingCodeGrade.totalScore).toBe(0);
     expect(missingCodeGrade.warnings.some((w) => w.kind === 'unmatched_key')).toBe(true);
+
+    // Step 5: Harsh Low-Light + Steep Diagonal Hand Shadow + High-ISO Sensor Noise Stress Test
+    // Simulate a dim classroom (~62% darker overall), a strong diagonal shadow across half the sheet,
+    // and deterministic high-ISO salt/grain noise (+/- 12 gray levels) on the real student photo.
+    const degradedRgba = new Uint8ClampedArray(imgData.data.length);
+    const W = imgData.width;
+    const H = imgData.height;
+    for (let y = 0; y < H; y++) {
+      const yn = y / H;
+      for (let x = 0; x < W; x++) {
+        const xn = x / W;
+        // Steep diagonal shadow: top-left gets 0.30x illumination, bottom-right gets 0.56x illumination
+        const shadowFactor = 0.30 + 0.26 * (0.55 * xn + 0.45 * yn);
+        // Deterministic pseudo-random ISO noise in [-11, +11]
+        const hash = ((x * 73856093) ^ (y * 19349663)) & 0xff;
+        const isoNoise = ((hash / 255) * 2 - 1) * 11;
+        const p = (y * W + x) * 4;
+        degradedRgba[p] = Math.max(
+          0,
+          Math.min(255, Math.round(imgData.data[p] * shadowFactor + isoNoise))
+        );
+        degradedRgba[p + 1] = Math.max(
+          0,
+          Math.min(255, Math.round(imgData.data[p + 1] * shadowFactor + isoNoise))
+        );
+        degradedRgba[p + 2] = Math.max(
+          0,
+          Math.min(255, Math.round(imgData.data[p + 2] * shadowFactor + isoNoise))
+        );
+        degradedRgba[p + 3] = 255;
+      }
+    }
+
+    const lowLightScan = scanSheetFromImageData(
+      { width: W, height: H, data: degradedRgba, colorSpace: 'srgb' } as ImageData,
+      syncedContest,
+      keys12,
+      { eraseMode: 'normal' }
+    );
+    expect(lowLightScan.cornersDetected).toBe(true);
+    expect(lowLightScan.sbd).toBe('11000001');
+    expect(lowLightScan.examCode).toBe('1003');
+    expect(lowLightScan.mcqAnswers).toEqual(preKeyScan.mcqAnswers);
+    expect(lowLightScan.tfAnswers).toEqual(preKeyScan.tfAnswers.slice(0, 2));
+    expect(lowLightScan.shortAnswers).toEqual(preKeyScan.shortAnswers.slice(0, 4));
+    expect(lowLightScan.grade.totalScore).toBe(5.5);
+    expect(lowLightScan.grade.warnings).toEqual([]);
   });
 });
