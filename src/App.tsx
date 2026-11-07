@@ -174,6 +174,7 @@ export const App: React.FC = () => {
             settings={state.settings}
             onBack={() => setOpenContestId(null)}
             onEditContest={() => setEditingContest(activeContest)}
+            onUpdateContest={(patch) => upsertContest({ ...activeContest, ...patch })}
             onUpsertKey={upsertKey}
             onDeleteKey={(kid) =>
               setState((prev) => ({ ...prev, keys: prev.keys.filter((k) => k.id !== kid) }))

@@ -8,6 +8,7 @@ import {
 } from '../sheets/sheetLayouts';
 import { computePaperGrade, normalizeNumericAnswer } from './grading';
 import { scanSheetFromImageData } from './omrEngine';
+import { parseAnswerKeyTable } from '../utils/exportUtils';
 import { AnswerKey, Contest, SheetFormId } from '../types';
 
 function makeContest(formId: SheetFormId): Contest {
@@ -223,5 +224,38 @@ describe('TNCraft Sheet Geometry & OMR Grading Engine', () => {
     expect(res.mcqAnswers).toEqual([...keyMcq]);
     expect(res.shortAnswers).toEqual(keyShort);
     expect(res.grade.totalScore).toBe(10);
+  });
+
+  it('parses column-per-code Vietnamese BGD-2025 Excel/CSV answer tables (Part I, Đ/S Part II, numeric Part III)', () => {
+    const contest = makeContest('bgd_2025');
+    contest.examCodeDigits = 3;
+    const table = [
+      ['Câu\\Mã đề', '1001', '1003'],
+      ['1', 'B', 'B'],
+      ['2', 'D', 'A'],
+      ['3', 'ĐSĐĐ', 'ĐSĐĐ'],
+      ['4', 'ĐĐSS', 'ĐĐSS'],
+      ['5', '5400', '-0,6'],
+      ['6', '-0,6', '3,5'],
+    ];
+
+    const { keys, contestPatch } = parseAnswerKeyTable(table, contest);
+    expect(keys).toHaveLength(2);
+    expect(contestPatch).toEqual({
+      examCodeDigits: 4,
+      enablePart1: true,
+      part1Questions: 2,
+      enablePart2: true,
+      part2Questions: 2,
+      enablePart3: true,
+      part3Questions: 2,
+    });
+    expect(keys[1].examCode).toBe('1003');
+    expect(keys[1].mcqAnswers).toEqual(['B', 'A']);
+    expect(keys[1].tfAnswers).toEqual([
+      { a: 'T', b: 'F', c: 'T', d: 'T' },
+      { a: 'T', b: 'T', c: 'F', d: 'F' },
+    ]);
+    expect(keys[1].shortAnswers).toEqual(['-0,6', '3,5']);
   });
 });

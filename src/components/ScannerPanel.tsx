@@ -136,8 +136,8 @@ export const ScannerPanel: React.FC<Props> = ({
       const wctx = workCanvas.getContext('2d')!;
       wctx.drawImage(vid, 0, 0, pw, ph);
       const imgData = wctx.getImageData(0, 0, pw, ph);
-      const { binary } = adaptiveThresholdImage(imgData.data, pw, ph, 0.84);
-      const quad = detectFiducialCorners(binary, pw, ph);
+      const { binary, gray } = adaptiveThresholdImage(imgData.data, pw, ph, 0.80, 32);
+      const quad = detectFiducialCorners(binary, pw, ph, gray);
 
       // Draw viewfinder overlay
       if (overlayCanvasRef.current) {

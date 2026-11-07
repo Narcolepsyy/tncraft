@@ -30,7 +30,7 @@ import {
   exportContestCsv,
   exportContestExcel,
   generateKeyQrDataUrl,
-  parseAnswerKeyCsv,
+  parseAnswerKeyBuffer,
 } from '../utils/exportUtils';
 import { uid } from '../storage/db';
 import { KeyEditorModal } from './KeyEditorModal';
@@ -46,6 +46,7 @@ interface Props {
   settings: AppSettings;
   onBack: () => void;
   onEditContest: () => void;
+  onUpdateContest?: (patch: Partial<Contest>) => void;
   onUpsertKey: (key: AnswerKey) => void;
   onDeleteKey: (keyId: string) => void;
   onUpsertPaper: (paper: StudentPaper) => void;
@@ -63,6 +64,7 @@ export const ContestDetailView: React.FC<Props> = ({
   settings,
   onBack,
   onEditContest,
+  onUpdateContest,
   onUpsertKey,
   onDeleteKey,
   onUpsertPaper,
@@ -113,22 +115,71 @@ export const ContestDetailView: React.FC<Props> = ({
     setEditingKey(undefined);
   };
 
-  const handleCsvKeyUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const parsed = parseAnswerKeyCsv(String(reader.result || ''), contest);
-      parsed.forEach((item) => {
-        onUpsertKey({
-          ...item,
-          id: uid('key'),
-          createdAt: new Date().toISOString().slice(0, 10),
-        });
-      });
-    };
-    reader.readAsText(file);
+  const handleCsvKeyUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = e.target.files;
+    if (!fileList || fileList.length === 0) return;
+    const files = Array.from(fileList);
     e.target.value = '';
+
+    let workingContest = contest;
+    let mergedPatch: Partial<Contest> = {};
+    const existingByCode = new Map(keys.map((k) => [k.examCode.trim(), k]));
+    const updatedKeysMap = new Map(keys.map((k) => [k.examCode.trim(), k]));
+
+    for (const file of files) {
+      try {
+        const buf = await file.arrayBuffer();
+        const { keys: parsedKeys, contestPatch } = await parseAnswerKeyBuffer(
+          buf,
+          file.name,
+          workingContest
+        );
+        if (contestPatch && Object.keys(contestPatch).length > 0) {
+          mergedPatch = { ...mergedPatch, ...contestPatch };
+          workingContest = { ...workingContest, ...contestPatch };
+        }
+        for (const item of parsedKeys) {
+          const prev = existingByCode.get(item.examCode.trim());
+          const saved: AnswerKey = {
+            ...item,
+            id: prev?.id || uid('key'),
+            createdAt: prev?.createdAt || new Date().toISOString().slice(0, 10),
+          };
+          onUpsertKey(saved);
+          existingByCode.set(saved.examCode.trim(), saved);
+          updatedKeysMap.set(saved.examCode.trim(), saved);
+        }
+      } catch {
+        alert(
+          lang === 'vi'
+            ? `Không đọc được file đáp án: ${file.name}`
+            : `Could not parse answer key file: ${file.name}`
+        );
+      }
+    }
+
+    if (onUpdateContest && Object.keys(mergedPatch).length > 0) {
+      onUpdateContest(mergedPatch);
+    }
+
+    const allUpdatedKeys = [...updatedKeysMap.values()];
+    if (allUpdatedKeys.length > 0 && papers.length > 0) {
+      papers.forEach((p) => {
+        const g = computePaperGrade(
+          workingContest,
+          allUpdatedKeys,
+          p.sbd,
+          p.examCode,
+          p.mcqAnswers,
+          p.tfAnswers,
+          p.shortAnswers,
+          p.part4EssayScore,
+          papers,
+          p.id
+        );
+        onUpsertPaper({ ...p, ...g });
+      });
+    }
   };
 
   const handleOpenKeyQr = async (k: AnswerKey) => {
@@ -289,7 +340,8 @@ export const ContestDetailView: React.FC<Props> = ({
             <input
               ref={csvKeyInputRef}
               type="file"
-              accept=".csv,.txt"
+              multiple
+              accept=".xlsx,.csv,.txt"
               style={{ display: 'none' }}
               onChange={handleCsvKeyUpload}
             />
@@ -359,6 +411,18 @@ export const ContestDetailView: React.FC<Props> = ({
                           .map((a, i) => `${i + 1}${a || '_'}`)
                           .join(' ')}
                         {k.mcqAnswers.length > 12 ? ' …' : ''}
+                        {k.tfAnswers.length > 0
+                          ? ` • P.II: ${k.tfAnswers
+                              .map((tf) =>
+                                [tf.a, tf.b, tf.c, tf.d]
+                                  .map((v) => (v === 'T' ? 'Đ' : v === 'F' ? 'S' : '_'))
+                                  .join('')
+                              )
+                              .join(' ')}`
+                          : ''}
+                        {k.shortAnswers.length > 0
+                          ? ` • P.III: ${k.shortAnswers.join(' | ')}`
+                          : ''}
                       </p>
                     </div>
                   </div>
