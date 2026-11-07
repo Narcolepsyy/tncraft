@@ -12,6 +12,7 @@ import {
   Plus,
   Printer,
   QrCode,
+  Search,
   Settings2,
   Trash2,
 } from 'lucide-react';
@@ -24,7 +25,7 @@ import {
   StudentPaper,
 } from '../types';
 import { SHEET_FORM_LABELS, t } from '../i18n';
-import { computeItemAnalysis, computePaperGrade } from '../omr/grading';
+import { computeItemAnalysis, computePaperGrade, matchAnswerKey } from '../omr/grading';
 import {
   decodeKeyQrPayload,
   exportContestCsv,
@@ -48,7 +49,9 @@ interface Props {
   onEditContest: () => void;
   onUpdateContest?: (patch: Partial<Contest>) => void;
   onUpsertKey: (key: AnswerKey) => void;
+  onImportKeysBatch?: (keys: AnswerKey[], contestPatch?: Partial<Contest>) => void;
   onDeleteKey: (keyId: string) => void;
+  onClearKeys?: () => void;
   onUpsertPaper: (paper: StudentPaper) => void;
   onDeletePaper: (paperId: string) => void;
 }
@@ -66,7 +69,9 @@ export const ContestDetailView: React.FC<Props> = ({
   onEditContest,
   onUpdateContest,
   onUpsertKey,
+  onImportKeysBatch,
   onDeleteKey,
+  onClearKeys,
   onUpsertPaper,
   onDeletePaper,
 }) => {
@@ -84,34 +89,29 @@ export const ContestDetailView: React.FC<Props> = ({
     'time'
   );
   const [statFilterCode, setStatFilterCode] = useState<string>('ALL');
+  const [keySearch, setKeySearch] = useState<string>('');
+  const [importNotice, setImportNotice] = useState<string>('');
   const csvKeyInputRef = useRef<HTMLInputElement | null>(null);
 
   const linkedClass = classes.find((c) => c.id === contest.classId);
 
-  // Re-evaluate existing papers whenever an AnswerKey is added/edited
+  const sortedKeys = useMemo(
+    () =>
+      [...keys].sort((a, b) =>
+        a.examCode.localeCompare(b.examCode, undefined, { numeric: true })
+      ),
+    [keys]
+  );
+
+  const visibleKeys = useMemo(() => {
+    const q = keySearch.trim().toLowerCase();
+    if (!q) return sortedKeys;
+    return sortedKeys.filter((k) => k.examCode.toLowerCase().includes(q));
+  }, [sortedKeys, keySearch]);
+
+  // App.tsx atomically updates keys and re-grades all papers for this contest
   const handleSaveKeyAndRegrade = (savedKey: AnswerKey) => {
     onUpsertKey(savedKey);
-    const updatedKeys = keys.some((k) => k.id === savedKey.id)
-      ? keys.map((k) => (k.id === savedKey.id ? savedKey : k))
-      : [...keys, savedKey];
-
-    papers.forEach((p) => {
-      if (p.examCode === savedKey.examCode || updatedKeys.length === 1) {
-        const g = computePaperGrade(
-          contest,
-          updatedKeys,
-          p.sbd,
-          p.examCode,
-          p.mcqAnswers,
-          p.tfAnswers,
-          p.shortAnswers,
-          p.part4EssayScore,
-          papers,
-          p.id
-        );
-        onUpsertPaper({ ...p, ...g });
-      }
-    });
     setEditingKey(undefined);
   };
 
@@ -124,7 +124,7 @@ export const ContestDetailView: React.FC<Props> = ({
     let workingContest = contest;
     let mergedPatch: Partial<Contest> = {};
     const existingByCode = new Map(keys.map((k) => [k.examCode.trim(), k]));
-    const updatedKeysMap = new Map(keys.map((k) => [k.examCode.trim(), k]));
+    const importedByCode = new Map<string, AnswerKey>();
 
     for (const file of files) {
       try {
@@ -139,15 +139,14 @@ export const ContestDetailView: React.FC<Props> = ({
           workingContest = { ...workingContest, ...contestPatch };
         }
         for (const item of parsedKeys) {
-          const prev = existingByCode.get(item.examCode.trim());
+          const code = item.examCode.trim();
+          const prev = importedByCode.get(code) || existingByCode.get(code);
           const saved: AnswerKey = {
             ...item,
             id: prev?.id || uid('key'),
             createdAt: prev?.createdAt || new Date().toISOString().slice(0, 10),
           };
-          onUpsertKey(saved);
-          existingByCode.set(saved.examCode.trim(), saved);
-          updatedKeysMap.set(saved.examCode.trim(), saved);
+          importedByCode.set(code, saved);
         }
       } catch {
         alert(
@@ -158,12 +157,32 @@ export const ContestDetailView: React.FC<Props> = ({
       }
     }
 
-    if (onUpdateContest && Object.keys(mergedPatch).length > 0) {
-      onUpdateContest(mergedPatch);
+    const batchList = [...importedByCode.values()].sort((a, b) =>
+      a.examCode.localeCompare(b.examCode, undefined, { numeric: true })
+    );
+
+    if (batchList.length === 0) {
+      alert(
+        lang === 'vi'
+          ? 'Không tìm thấy bảng mã đề hợp lệ trong file đã chọn.'
+          : 'No valid answer key table found in the selected file(s).'
+      );
+      return;
     }
 
-    const allUpdatedKeys = [...updatedKeysMap.values()];
-    if (allUpdatedKeys.length > 0 && papers.length > 0) {
+    if (onImportKeysBatch) {
+      onImportKeysBatch(
+        batchList,
+        Object.keys(mergedPatch).length > 0 ? mergedPatch : undefined
+      );
+    } else {
+      for (const item of batchList) onUpsertKey(item);
+      if (onUpdateContest && Object.keys(mergedPatch).length > 0) {
+        onUpdateContest(mergedPatch);
+      }
+      const allKeysMap = new Map(keys.map((k) => [k.examCode.trim(), k]));
+      for (const item of batchList) allKeysMap.set(item.examCode.trim(), item);
+      const allUpdatedKeys = [...allKeysMap.values()];
       papers.forEach((p) => {
         const g = computePaperGrade(
           workingContest,
@@ -180,6 +199,17 @@ export const ContestDetailView: React.FC<Props> = ({
         onUpsertPaper({ ...p, ...g });
       });
     }
+
+    const firstCode = batchList[0].examCode;
+    const lastCode = batchList[batchList.length - 1].examCode;
+    const rangeLabel =
+      batchList.length === 1 ? firstCode : `${firstCode} → ${lastCode}`;
+    setImportNotice(
+      lang === 'vi'
+        ? `✓ Đã nhập ${batchList.length} mã đề (${rangeLabel}) và tự động đồng bộ cấu trúc câu hỏi!`
+        : `✓ Imported ${batchList.length} exam code(s) (${rangeLabel}) and synced question counts!`
+    );
+    setTimeout(() => setImportNotice(''), 5000);
   };
 
   const handleOpenKeyQr = async (k: AnswerKey) => {
@@ -256,9 +286,41 @@ export const ContestDetailView: React.FC<Props> = ({
   }, [papers, contest.maxScore]);
 
   const itemStats = useMemo(
-    () => computeItemAnalysis(contest, keys, papers, statFilterCode),
-    [contest, keys, papers, statFilterCode]
+    () => computeItemAnalysis(contest, sortedKeys, papers, statFilterCode),
+    [contest, sortedKeys, papers, statFilterCode]
   );
+
+  const perCodeBreakdown = useMemo(() => {
+    const groups = sortedKeys.map((k) => ({
+      code: k.examCode,
+      count: 0,
+      sumScore: 0,
+    }));
+    const byCode = new Map(groups.map((g) => [g.code, g]));
+    let unmatchedCount = 0;
+
+    for (const p of papers) {
+      const m = matchAnswerKey(sortedKeys, p.examCode);
+      if (m.matchedKey) {
+        const entry = byCode.get(m.matchedKey.examCode);
+        if (entry) {
+          entry.count += 1;
+          entry.sumScore += p.totalScore;
+        }
+      } else {
+        unmatchedCount += 1;
+      }
+    }
+
+    return {
+      items: groups.map((g) => ({
+        code: g.code,
+        count: g.count,
+        avg: g.count > 0 ? Number((g.sumScore / g.count).toFixed(2)) : null,
+      })),
+      unmatchedCount,
+    };
+  }, [sortedKeys, papers]);
 
   return (
     <div className="detail-view">
@@ -341,7 +403,7 @@ export const ContestDetailView: React.FC<Props> = ({
               ref={csvKeyInputRef}
               type="file"
               multiple
-              accept=".xlsx,.csv,.txt"
+              accept=".xlsx,.docx,.csv,.txt"
               style={{ display: 'none' }}
               onChange={handleCsvKeyUpload}
             />
@@ -352,7 +414,42 @@ export const ContestDetailView: React.FC<Props> = ({
             >
               <QrCode size={16} /> {tr.detail.importKeyQr}
             </button>
+            {sortedKeys.length > 1 && onClearKeys && (
+              <button
+                type="button"
+                className="secondary-btn"
+                style={{ color: '#dc2626' }}
+                onClick={() => {
+                  const ok = window.confirm(
+                    lang === 'vi'
+                      ? `Xóa toàn bộ ${sortedKeys.length} mã đề của bài thi này?`
+                      : `Clear all ${sortedKeys.length} exam keys from this contest?`
+                  );
+                  if (ok) onClearKeys();
+                }}
+              >
+                <Trash2 size={15} /> {lang === 'vi' ? 'Xóa hết mã' : 'Clear All'}
+              </button>
+            )}
           </div>
+
+          {importNotice && <div className="toast-success">{importNotice}</div>}
+
+          {sortedKeys.length > 6 && (
+            <div className="search-box" style={{ marginBottom: 12 }}>
+              <Search size={16} />
+              <input
+                type="text"
+                placeholder={
+                  lang === 'vi'
+                    ? `Tìm nhanh trong ${sortedKeys.length} mã đề...`
+                    : `Filter ${sortedKeys.length} exam codes...`
+                }
+                value={keySearch}
+                onChange={(e) => setKeySearch(e.target.value)}
+              />
+            </div>
+          )}
 
           {showQrImport && (
             <div className="section-box">
@@ -393,17 +490,34 @@ export const ContestDetailView: React.FC<Props> = ({
             </div>
           )}
 
-          {keys.length === 0 ? (
-            <div className="empty-card">{tr.detail.noKeys}</div>
+          {sortedKeys.length === 0 ? (
+            <div className="empty-card">
+              {tr.detail.noKeys}
+              <p className="muted-text" style={{ marginTop: 6, fontSize: 13 }}>
+                {lang === 'vi'
+                  ? 'Hỗ trợ không giới hạn số lượng mã đề (1, 4, 6, 12, 24+ mã) từ file Excel (.xlsx), Word HDC (.docx) hoặc CSV.'
+                  : 'Supports any number of exam codes (1, 4, 6, 12, 24+) imported from Excel (.xlsx), Word (.docx), or CSV.'}
+              </p>
+            </div>
           ) : (
             <div className="card-list">
-              {keys.map((k) => (
+              {visibleKeys.map((k) => {
+                const usedCount = papers.filter(
+                  (p) => matchAnswerKey(sortedKeys, p.examCode).matchedKey?.id === k.id
+                ).length;
+                return (
                 <div key={k.id} className="item-card">
                   <div className="item-card-main" onClick={() => setEditingKey(k)}>
                     <div className="code-badge">{k.examCode}</div>
                     <div className="item-card-info">
                       <h4>
                         {tr.detail.examCode} {k.examCode}
+                        {usedCount > 0 && (
+                          <span className="muted-inline">
+                            {' '}
+                            • {usedCount} {lang === 'vi' ? 'bài' : 'papers'}
+                          </span>
+                        )}
                       </h4>
                       <p className="mono-preview">
                         {k.mcqAnswers
@@ -453,7 +567,8 @@ export const ContestDetailView: React.FC<Props> = ({
                     </button>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -637,6 +752,43 @@ export const ContestDetailView: React.FC<Props> = ({
             </div>
           </div>
 
+          {sortedKeys.length > 0 && (
+            <div className="section-box">
+              <h4 className="sub-heading">
+                {lang === 'vi'
+                  ? `Thống kê theo từng Mã đề (${sortedKeys.length} mã)`
+                  : `Breakdown by Exam Code (${sortedKeys.length} codes)`}
+              </h4>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                {perCodeBreakdown.items.map((item) => {
+                  const isSelected = statFilterCode === item.code;
+                  return (
+                    <button
+                      key={item.code}
+                      type="button"
+                      className={isSelected ? 'primary-btn' : 'secondary-btn'}
+                      style={{ padding: '6px 10px', fontSize: 13 }}
+                      onClick={() =>
+                        setStatFilterCode((cur) => (cur === item.code ? 'ALL' : item.code))
+                      }
+                    >
+                      <strong>{item.code}</strong>: {item.count}{' '}
+                      {lang === 'vi' ? 'bài' : 'p.'}
+                      {item.avg !== null ? ` (${lang === 'vi' ? 'TB' : 'Avg'} ${item.avg})` : ''}
+                    </button>
+                  );
+                })}
+                {perCodeBreakdown.unmatchedCount > 0 && (
+                  <span className="tier-pill err" style={{ alignSelf: 'center' }}>
+                    {lang === 'vi'
+                      ? `Chưa khớp mã đề: ${perCodeBreakdown.unmatchedCount} bài`
+                      : `Unmatched code: ${perCodeBreakdown.unmatchedCount} paper(s)`}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="section-box">
             <div className="row-between" style={{ marginBottom: 10 }}>
               <h4 className="sub-heading" style={{ margin: 0 }}>
@@ -648,8 +800,12 @@ export const ContestDetailView: React.FC<Props> = ({
                 value={statFilterCode}
                 onChange={(e) => setStatFilterCode(e.target.value)}
               >
-                <option value="ALL">{lang === 'vi' ? 'Tất cả mã đề' : 'All Codes'}</option>
-                {keys.map((k) => (
+                <option value="ALL">
+                  {lang === 'vi'
+                    ? `Tất cả mã đề (${sortedKeys.length})`
+                    : `All Codes (${sortedKeys.length})`}
+                </option>
+                {sortedKeys.map((k) => (
                   <option key={k.id} value={k.examCode}>
                     {tr.detail.examCode} {k.examCode}
                   </option>
@@ -705,6 +861,7 @@ export const ContestDetailView: React.FC<Props> = ({
         <KeyEditorModal
           lang={lang}
           contest={contest}
+          existingKeys={sortedKeys}
           initial={editingKey}
           onClose={() => setEditingKey(undefined)}
           onSave={handleSaveKeyAndRegrade}
@@ -715,7 +872,7 @@ export const ContestDetailView: React.FC<Props> = ({
         <PaperRepairModal
           lang={lang}
           contest={contest}
-          keys={keys}
+          keys={sortedKeys}
           students={students}
           existingPapers={papers}
           paper={repairingPaper}

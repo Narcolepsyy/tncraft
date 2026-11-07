@@ -3,15 +3,23 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { parseAnswerKeyBuffer } from '../src/utils/exportUtils';
+import { computePaperGrade, syncContestMaxScore } from '../src/omr/grading';
 import { scanSheetFromImageData } from '../src/omr/omrEngine';
 import { AnswerKey, Contest } from '../src/types';
 
 const REAL_DATA_DIR = path.resolve(__dirname, '../../real_data');
+const SUBFOLDER_DIR = path.join(REAL_DATA_DIR, 'MT_DE_HDC_GK1_TOAN_11');
 const xlsxFiles = fs.existsSync(REAL_DATA_DIR)
   ? fs.readdirSync(REAL_DATA_DIR).filter((f) => f.toLowerCase().endsWith('.xlsx')).sort()
   : [];
 const jpgFiles = fs.existsSync(REAL_DATA_DIR)
   ? fs.readdirSync(REAL_DATA_DIR).filter((f) => /\.(jpe?g|png)$/i.test(f)).sort()
+  : [];
+const docxHdcFiles = fs.existsSync(SUBFOLDER_DIR)
+  ? fs
+      .readdirSync(SUBFOLDER_DIR)
+      .filter((f) => f.toLowerCase().startsWith('hdc_') && f.toLowerCase().endsWith('.docx'))
+      .sort()
   : [];
 const hasRealData = xlsxFiles.length >= 2 && jpgFiles.length >= 1;
 
@@ -147,5 +155,136 @@ describe.runIf(hasRealData)('Real-World Vietnamese Exam Data Integration (real_d
       expect(res.grade.totalScore).toBe(5.5);
       expect(res.grade.warnings).toEqual([]);
     }
+  });
+
+  it('imports all 12 Mã đề directly from the multi-table Word HDC (.docx), skips essay rubric tables, and supports scan-before-import & variable Mã đề counts (1, 4, 6, 12)', async () => {
+    expect(docxHdcFiles.length).toBeGreaterThanOrEqual(1);
+
+    const initialContest: Contest = {
+      id: 'real_flow_test',
+      name: 'Dynamic Codes Flow',
+      createdAt: '2026-11-06',
+      classId: null,
+      formId: 'bgd_2025',
+      choiceCount: 4,
+      sbdDigits: 6,
+      examCodeDigits: 3,
+      totalQuestions: 40,
+      maxScore: 10,
+      subjectSplits: [],
+      enablePart1: true,
+      part1Questions: 12,
+      part1TotalScore: 3.0,
+      enablePart2: true,
+      part2Questions: 4, // default 4 before importing key (actual exam has 2)
+      part2Score1: 0.1,
+      part2Score2: 0.25,
+      part2Score3: 0.5,
+      part2Score4: 1.0,
+      enablePart3: true,
+      part3Questions: 6, // default 6 before importing key (actual exam has 4)
+      part3TotalScore: 2.0,
+      enablePart4Essay: true,
+      part4MaxScore: 3.0,
+    };
+
+    // Step 1: Scan BEFORE importing any answer keys (order-independent workflow)
+    const photoPath = path.join(REAL_DATA_DIR, jpgFiles[0]);
+    const imgData = decodeJpegViaPython(photoPath, 2000);
+    const preKeyScan = scanSheetFromImageData(imgData, initialContest, [], {
+      eraseMode: 'normal',
+    });
+    expect(preKeyScan.sbd).toBe('11000001');
+    expect(preKeyScan.examCode).toBe('1003');
+    expect(preKeyScan.grade.totalScore).toBe(0);
+    expect(preKeyScan.grade.warnings.some((w) => w.kind === 'unmatched_key')).toBe(true);
+
+    // Step 2: Import the single Word HDC .docx containing 2 answer tables + 2 essay rubric tables
+    const docxBuf = fs.readFileSync(path.join(SUBFOLDER_DIR, docxHdcFiles[0]));
+    const docxAb = docxBuf.buffer.slice(
+      docxBuf.byteOffset,
+      docxBuf.byteOffset + docxBuf.byteLength
+    );
+    const parsedDocx = await parseAnswerKeyBuffer(docxAb, docxHdcFiles[0], initialContest);
+
+    // Must extract all 12 exam codes (1001..1012) in ascending numeric order and ignore essay tables
+    expect(parsedDocx.keys.map((k) => k.examCode)).toEqual([
+      '1001',
+      '1002',
+      '1003',
+      '1004',
+      '1005',
+      '1006',
+      '1007',
+      '1008',
+      '1009',
+      '1010',
+      '1011',
+      '1012',
+    ]);
+    expect(parsedDocx.contestPatch).toEqual({
+      examCodeDigits: 4,
+      enablePart1: true,
+      part1Questions: 12,
+      enablePart2: true,
+      part2Questions: 2,
+      enablePart3: true,
+      part3Questions: 4,
+    });
+
+    const syncedContest = syncContestMaxScore({
+      ...initialContest,
+      ...parsedDocx.contestPatch,
+    });
+    expect(syncedContest.maxScore).toBe(10); // 3.0 + 2*1.0 + 2.0 + 3.0 = 10.0
+
+    const keys12: AnswerKey[] = parsedDocx.keys.map((k, i) => ({
+      ...k,
+      id: `dk_${i}`,
+      createdAt: '2026-11-06',
+    }));
+
+    // Step 3: Re-grading the pre-scanned paper after importing 12 keys yields exact 5.50 with 0 warnings
+    const regraded12 = computePaperGrade(
+      syncedContest,
+      keys12,
+      preKeyScan.sbd,
+      preKeyScan.examCode,
+      preKeyScan.mcqAnswers,
+      preKeyScan.tfAnswers,
+      preKeyScan.shortAnswers,
+      0
+    );
+    expect(regraded12.totalScore).toBe(5.5);
+    expect(regraded12.warnings).toEqual([]);
+
+    // Step 4: Verify subsets of 4 Mã đề (1001..1004), 6 Mã đề (odd codes), and 1 Mã đề (1003)
+    const keys4 = keys12.slice(0, 4);
+    expect(
+      computePaperGrade(
+        syncedContest,
+        keys4,
+        preKeyScan.sbd,
+        preKeyScan.examCode,
+        preKeyScan.mcqAnswers,
+        preKeyScan.tfAnswers,
+        preKeyScan.shortAnswers
+      ).totalScore
+    ).toBe(5.5);
+
+    // And if 1003 is missing from a multi-code contest (e.g. only even codes 1002..1012 imported so far),
+    // it must NOT falsely grade against 1002!
+    const evenKeys6 = keys12.filter((k) => Number(k.examCode) % 2 === 0);
+    const missingCodeGrade = computePaperGrade(
+      syncedContest,
+      evenKeys6,
+      preKeyScan.sbd,
+      preKeyScan.examCode,
+      preKeyScan.mcqAnswers,
+      preKeyScan.tfAnswers,
+      preKeyScan.shortAnswers
+    );
+    expect(missingCodeGrade.totalScore).toBe(0);
+    expect(missingCodeGrade.warnings.some((w) => w.kind === 'unmatched_key')).toBe(true);
   });
 });

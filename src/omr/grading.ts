@@ -22,6 +22,32 @@ export function normalizeNumericAnswer(raw: string): string {
   return cleaned;
 }
 
+export function matchAnswerKey(
+  keys: AnswerKey[],
+  examCode: string
+): { matchedKey?: AnswerKey; exact: boolean } {
+  const code = (examCode || '').trim();
+  if (code) {
+    const exactHit = keys.find((k) => k.examCode.trim() === code);
+    if (exactHit) return { matchedKey: exactHit, exact: true };
+
+    const stripped = code.replace(/^0+/, '');
+    if (stripped) {
+      const numericHits = keys.filter((k) => k.examCode.trim().replace(/^0+/, '') === stripped);
+      if (numericHits.length === 1) {
+        return { matchedKey: numericHits[0], exact: true };
+      }
+    }
+  }
+
+  // Only fall back to single key when the contest genuinely has just 1 Mã đề
+  if (keys.length === 1) {
+    return { matchedKey: keys[0], exact: false };
+  }
+
+  return { matchedKey: undefined, exact: false };
+}
+
 export interface GradeComputation {
   scorePart1: number;
   scorePart2: number;
@@ -66,16 +92,19 @@ export function computePaperGrade(
     });
   }
 
-  const matchedKey =
-    keys.find((k) => k.examCode.trim() === examCode.trim()) ||
-    (keys.length === 1 ? keys[0] : undefined);
+  const { matchedKey, exact } = matchAnswerKey(keys, examCode);
 
-  if (!keys.find((k) => k.examCode.trim() === examCode.trim())) {
+  if (!exact) {
     warnings.push({
       kind: 'unmatched_key',
       message: matchedKey
-        ? `Exam code "${examCode || 'blank'}" not found — graded with fallback key "${matchedKey.examCode}"`
-        : `No matching Answer Key for exam code "${examCode || 'blank'}"`,
+        ? `Exam code "${examCode || 'blank'}" not matched — using single key "${matchedKey.examCode}"`
+        : keys.length === 0
+          ? 'No Answer Keys added to this contest yet'
+          : `Exam code "${examCode || 'blank'}" not found among ${keys.length} Answer Keys (${keys
+              .slice(0, 5)
+              .map((k) => k.examCode)
+              .join(', ')}${keys.length > 5 ? ', …' : ''})`,
     });
   }
 
@@ -267,6 +296,21 @@ export function roundScore(val: number): number {
   return Math.round((val + Number.EPSILON) * 100) / 100;
 }
 
+export function syncContestMaxScore(contest: Contest): Contest {
+  if (contest.formId !== 'bgd_2025') return contest;
+  const computed =
+    (contest.enablePart1 && contest.part1Questions > 0 ? contest.part1TotalScore : 0) +
+    (contest.enablePart2 && contest.part2Questions > 0
+      ? contest.part2Questions * contest.part2Score4
+      : 0) +
+    (contest.enablePart3 && contest.part3Questions > 0 ? contest.part3TotalScore : 0) +
+    (contest.enablePart4Essay ? contest.part4MaxScore : 0);
+  return {
+    ...contest,
+    maxScore: roundScore(computed),
+  };
+}
+
 export function resolveStudentFromRoster(
   sbd: string,
   students: Student[],
@@ -304,11 +348,21 @@ export function computeItemAnalysis(
   const filteredPapers =
     filterExamCode === 'ALL'
       ? papers
-      : papers.filter((p) => p.examCode === filterExamCode);
+      : papers.filter((p) => matchAnswerKey([ { id: '', contestId: '', examCode: filterExamCode, createdAt: '', mcqAnswers: [], tfAnswers: [], shortAnswers: [] } ], p.examCode).exact);
 
   const items: QuestionStatItem[] = [];
-  const findKey = (code: string) =>
-    keys.find((k) => k.examCode === code) || (keys.length === 1 ? keys[0] : undefined);
+  const findKey = (code: string) => matchAnswerKey(keys, code).matchedKey;
+  const resolveDisplayKey = (getter: (k: AnswerKey) => string): string => {
+    if (filterExamCode !== 'ALL') {
+      const k = findKey(filterExamCode);
+      return (k ? getter(k) : '') || '-';
+    }
+    if (keys.length === 0) return '-';
+    const vals = keys.map((k) => getter(k)).filter(Boolean);
+    if (vals.length === 0) return '-';
+    const unique = new Set(vals);
+    return unique.size === 1 ? vals[0] : 'Đa mã';
+  };
 
   if (contest.formId !== 'bgd_2025') {
     const opts = contest.choiceCount === 5 ? ['A', 'B', 'C', 'D', 'E'] : ['A', 'B', 'C', 'D'];
@@ -324,7 +378,7 @@ export function computeItemAnalysis(
         else counts[ans] = (counts[ans] || 0) + 1;
         if (k && k.mcqAnswers[i] && ans === k.mcqAnswers[i]) correct++;
       }
-      const singleKey = filterExamCode !== 'ALL' ? findKey(filterExamCode)?.mcqAnswers[i] || '-' : keys[0]?.mcqAnswers[i] || '-';
+      const singleKey = resolveDisplayKey((k) => k.mcqAnswers[i] || '');
       items.push({
         label: `Q${i + 1}`,
         part: 'I',
@@ -349,7 +403,7 @@ export function computeItemAnalysis(
         else counts[ans] = (counts[ans] || 0) + 1;
         if (k && k.mcqAnswers[i] && ans === k.mcqAnswers[i]) correct++;
       }
-      const singleKey = filterExamCode !== 'ALL' ? findKey(filterExamCode)?.mcqAnswers[i] || '-' : keys[0]?.mcqAnswers[i] || '-';
+      const singleKey = resolveDisplayKey((k) => k.mcqAnswers[i] || '');
       items.push({
         label: `I.${i + 1}`,
         part: 'I',
@@ -374,14 +428,14 @@ export function computeItemAnalysis(
           else counts[ans] = (counts[ans] || 0) + 1;
           if (k && k.tfAnswers[i]?.[sub] && ans === k.tfAnswers[i][sub]) correct++;
         }
-        const kv =
-          filterExamCode !== 'ALL'
-            ? findKey(filterExamCode)?.tfAnswers[i]?.[sub] || '-'
-            : keys[0]?.tfAnswers[i]?.[sub] || '-';
+        const rawKv = resolveDisplayKey((k) => {
+          const v = k.tfAnswers[i]?.[sub] || '';
+          return v === 'T' ? 'Đ' : v === 'F' ? 'S' : '';
+        });
         items.push({
           label: `II.${i + 1}${sub}`,
           part: 'II',
-          correctKey: kv === 'T' ? 'Đ' : kv === 'F' ? 'S' : '-',
+          correctKey: rawKv,
           totalGraded: filteredPapers.length,
           correctPct: filteredPapers.length ? Math.round((correct / filteredPapers.length) * 100) : 0,
           counts,
@@ -409,10 +463,7 @@ export function computeItemAnalysis(
           counts.WRONG++;
         }
       }
-      const kv =
-        filterExamCode !== 'ALL'
-          ? findKey(filterExamCode)?.shortAnswers[i] || '-'
-          : keys[0]?.shortAnswers[i] || '-';
+      const kv = resolveDisplayKey((k) => k.shortAnswers[i] || '');
       items.push({
         label: `III.${i + 1}`,
         part: 'III',

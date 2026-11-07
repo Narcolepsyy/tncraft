@@ -202,6 +202,11 @@ export const CreateContestModal: React.FC<Props> = ({
                   <option value={4}>4 MĐ</option>
                 </select>
               </div>
+              <small className="field-hint">
+                {lang === 'vi'
+                  ? 'Số lượng mã đề không cố định (1, 4, 6, 12, 24+ mã) — nhập tự động từ Excel/Word ở mục Đáp án.'
+                  : 'Number of exam codes is unlimited (1, 4, 6, 12, 24+) — add or import from Excel/Word in Keys.'}
+              </small>
             </label>
           </div>
 
@@ -273,8 +278,8 @@ export const CreateContestModal: React.FC<Props> = ({
                     <span>{lang === 'vi' ? 'Tổng điểm Phần I' : 'Part I Total Points'}</span>
                     <input
                       type="number"
-                      step="0.25"
-                      min={0.25}
+                      step="0.05"
+                      min={0.05}
                       className="text-input"
                       value={part1TotalScore}
                       onChange={(e) => setPart1TotalScore(Number(e.target.value))}
@@ -382,8 +387,8 @@ export const CreateContestModal: React.FC<Props> = ({
                     <span>{lang === 'vi' ? 'Tổng điểm Phần III' : 'Part III Total Points'}</span>
                     <input
                       type="number"
-                      step="0.25"
-                      min={0.25}
+                      step="0.05"
+                      min={0.05}
                       className="text-input"
                       value={part3TotalScore}
                       onChange={(e) => setPart3TotalScore(Number(e.target.value))}
@@ -409,8 +414,8 @@ export const CreateContestModal: React.FC<Props> = ({
                   <span>{lang === 'vi' ? 'Điểm tối đa Tự luận' : 'Max Essay Score'}</span>
                   <input
                     type="number"
-                    step="0.25"
-                    min={0.25}
+                    step="0.05"
+                    min={0.05}
                     className="text-input"
                     value={part4MaxScore}
                     onChange={(e) => setPart4MaxScore(Number(e.target.value))}

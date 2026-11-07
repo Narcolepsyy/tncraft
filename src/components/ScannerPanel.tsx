@@ -1,5 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Camera,
   CameraOff,
   Check,
@@ -26,7 +27,7 @@ import {
   scanSheetFromImageData,
 } from '../omr/omrEngine';
 import { renderSheetToCanvas } from '../sheets/sheetLayouts';
-import { resolveStudentFromRoster } from '../omr/grading';
+import { computePaperGrade, resolveStudentFromRoster } from '../omr/grading';
 import { savePaperImage, uid } from '../storage/db';
 
 interface Props {
@@ -59,10 +60,20 @@ export const ScannerPanel: React.FC<Props> = ({
   const [cameraError, setCameraError] = useState<string>('');
   const [lockedCorners, setLockedCorners] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [selectedSbd, setSelectedSbd] = useState<string>('');
+  const [selectedExamCode, setSelectedExamCode] = useState<string>('');
   const [sourceCanvas, setSourceCanvas] = useState<HTMLCanvasElement | null>(null);
   const [manualCropMode, setManualCropMode] = useState(false);
   const [cropQuad, setCropQuad] = useState<CornerQuad | null>(null);
   const [savedNotice, setSavedNotice] = useState<string>('');
+
+  const sortedKeys = useMemo(
+    () =>
+      [...keys].sort((a, b) =>
+        a.examCode.localeCompare(b.examCode, undefined, { numeric: true })
+      ),
+    [keys]
+  );
 
   const stopCamera = () => {
     if (streamRef.current) {
@@ -201,8 +212,13 @@ export const ScannerPanel: React.FC<Props> = ({
     setSourceCanvas(canvas);
     const ctx = canvas.getContext('2d')!;
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const res = scanSheetFromImageData(imgData, contest, keys, settings, customQuad);
+    const res = scanSheetFromImageData(imgData, contest, sortedKeys, settings, customQuad);
     setScanResult(res);
+    setSelectedSbd(res.sbd);
+    // Only fall back to keys[0] when the contest truly has just 1 Mã đề
+    setSelectedExamCode(
+      res.examCode || (sortedKeys.length === 1 ? sortedKeys[0].examCode : '')
+    );
     setCropQuad(res.corners);
     setManualCropMode(false);
 
@@ -233,8 +249,12 @@ export const ScannerPanel: React.FC<Props> = ({
   };
 
   const handleGenerateAndScanSample = () => {
-    const refKey = keys[0];
-    const code = refKey?.examCode || (contest.examCodeDigits === 4 ? '0101' : '101');
+    const refKey =
+      sortedKeys.length > 0
+        ? sortedKeys[existingPapers.length % sortedKeys.length]
+        : undefined;
+    const rawCode = refKey?.examCode || (contest.examCodeDigits === 4 ? '1001' : '101');
+    const code = rawCode.padStart(contest.examCodeDigits, '0').slice(-contest.examCodeDigits);
     const nextIdx = (existingPapers.length + 1) % 99;
     const demoSbd = String(10000 + nextIdx).padStart(contest.sbdDigits, '0');
 
@@ -281,9 +301,26 @@ export const ScannerPanel: React.FC<Props> = ({
     processSourceCanvas(sampleCanvas);
   };
 
+  const activeGrade = useMemo(() => {
+    if (!scanResult) return null;
+    return computePaperGrade(
+      contest,
+      sortedKeys,
+      selectedSbd,
+      selectedExamCode,
+      scanResult.mcqAnswers,
+      scanResult.tfAnswers,
+      scanResult.shortAnswers,
+      0,
+      existingPapers
+    );
+  }, [contest, sortedKeys, selectedSbd, selectedExamCode, scanResult, existingPapers]);
+
   const handleConfirmSave = async () => {
-    if (!scanResult) return;
-    const rosterMatch = resolveStudentFromRoster(scanResult.sbd, students, contest.classId);
+    if (!scanResult || !activeGrade) return;
+    const finalSbd = selectedSbd.trim() || '000000';
+    const finalCode = selectedExamCode.trim();
+    const rosterMatch = resolveStudentFromRoster(finalSbd, students, contest.classId);
     const paperId = uid('pap');
 
     if (scanResult.annotatedDataUrl) {
@@ -294,8 +331,8 @@ export const ScannerPanel: React.FC<Props> = ({
       id: paperId,
       contestId: contest.id,
       scannedAt: new Date().toISOString(),
-      sbd: scanResult.sbd || '000000',
-      examCode: scanResult.examCode || keys[0]?.examCode || '',
+      sbd: finalSbd,
+      examCode: finalCode,
       studentId: rosterMatch.studentId,
       studentName: rosterMatch.studentName,
       roomName: rosterMatch.roomName,
@@ -303,15 +340,15 @@ export const ScannerPanel: React.FC<Props> = ({
       tfAnswers: scanResult.tfAnswers,
       shortAnswers: scanResult.shortAnswers,
       part4EssayScore: 0,
-      ...scanResult.grade,
+      ...activeGrade,
       annotatedImageDataUrl: scanResult.annotatedDataUrl,
     };
 
     onSavePaper(paper);
     setSavedNotice(
       lang === 'vi'
-        ? `Đã lưu bài SBD ${paper.sbd} — ${paper.totalScore}/${paper.maxPossibleScore} điểm!`
-        : `Saved ID ${paper.sbd} — ${paper.totalScore}/${paper.maxPossibleScore} pts!`
+        ? `Đã lưu bài SBD ${paper.sbd}${paper.examCode ? ` (MĐ ${paper.examCode})` : ''} — ${paper.totalScore}/${paper.maxPossibleScore} điểm!`
+        : `Saved ID ${paper.sbd}${paper.examCode ? ` (Code ${paper.examCode})` : ''} — ${paper.totalScore}/${paper.maxPossibleScore} pts!`
     );
     setScanResult(null);
     setTimeout(() => setSavedNotice(''), 3500);
@@ -388,17 +425,17 @@ export const ScannerPanel: React.FC<Props> = ({
         </div>
       )}
 
-      {scanResult && !manualCropMode && (
+      {scanResult && activeGrade && !manualCropMode && (
         <div className="scan-result-card">
           <div className="score-banner">
             <div>
               <div className="score-big">
-                {scanResult.grade.totalScore}{' '}
-                <span className="score-denom">/ {scanResult.grade.maxPossibleScore}</span>
+                {activeGrade.totalScore}{' '}
+                <span className="score-denom">/ {activeGrade.maxPossibleScore}</span>
               </div>
               <div className="score-parts">
-                SBD: <strong>{scanResult.sbd || '---'}</strong> • Mã đề:{' '}
-                <strong>{scanResult.examCode || '---'}</strong>
+                SBD: <strong>{selectedSbd || '---'}</strong> • Mã đề:{' '}
+                <strong>{selectedExamCode || '---'}</strong>
                 {!scanResult.cornersDetected && (
                   <span style={{ color: '#fbbf24', marginLeft: 8 }}>
                     ({lang === 'vi' ? 'Chưa thấy đủ 4 góc đen' : 'Auto-corners fallback'})
@@ -407,10 +444,78 @@ export const ScannerPanel: React.FC<Props> = ({
               </div>
             </div>
             <div className="score-counts">
-              <span className="badge-ok">✓ {scanResult.grade.correctCount}</span>
-              <span className="badge-err">✗ {scanResult.grade.wrongCount}</span>
-              <span className="badge-warn">∅ {scanResult.grade.blankCount}</span>
+              <span className="badge-ok">✓ {activeGrade.correctCount}</span>
+              <span className="badge-err">✗ {activeGrade.wrongCount}</span>
+              <span className="badge-warn">∅ {activeGrade.blankCount}</span>
             </div>
+          </div>
+
+          {activeGrade.warnings.length > 0 && (
+            <div className="warning-stack" style={{ marginTop: 10 }}>
+              {activeGrade.warnings.map((w, idx) => (
+                <div key={idx} className="warning-item">
+                  <AlertTriangle size={15} />
+                  <span>{w.message}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="grid-2" style={{ marginTop: 10, marginBottom: 6 }}>
+            <label className="field-label" style={{ marginBottom: 0 }}>
+              <span>{lang === 'vi' ? 'SBD nhận diện' : 'Detected Student ID'}</span>
+              <input
+                type="text"
+                className="text-input mono-input"
+                value={selectedSbd}
+                onChange={(e) => setSelectedSbd(e.target.value)}
+              />
+            </label>
+            <label className="field-label" style={{ marginBottom: 0 }}>
+              <span>
+                {lang === 'vi'
+                  ? `Mã đề (${sortedKeys.length} mã đáp án)`
+                  : `Exam Code (${sortedKeys.length} keys)`}
+              </span>
+              {sortedKeys.length > 0 ? (
+                <div className="seg-row">
+                  <input
+                    type="text"
+                    className="text-input mono-input"
+                    style={{ minWidth: 74 }}
+                    value={selectedExamCode}
+                    placeholder="---"
+                    onChange={(e) => setSelectedExamCode(e.target.value)}
+                  />
+                  <select
+                    className="text-input"
+                    value={
+                      sortedKeys.some((k) => k.examCode === selectedExamCode.trim())
+                        ? selectedExamCode.trim()
+                        : ''
+                    }
+                    onChange={(e) => {
+                      if (e.target.value) setSelectedExamCode(e.target.value);
+                    }}
+                  >
+                    <option value="">{lang === 'vi' ? 'Chọn mã...' : 'Pick...'}</option>
+                    {sortedKeys.map((k) => (
+                      <option key={k.id} value={k.examCode}>
+                        {k.examCode}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <input
+                  type="text"
+                  className="text-input mono-input"
+                  value={selectedExamCode}
+                  placeholder="---"
+                  onChange={(e) => setSelectedExamCode(e.target.value)}
+                />
+              )}
+            </label>
           </div>
 
           {scanResult.annotatedDataUrl && (

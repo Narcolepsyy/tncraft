@@ -6,10 +6,16 @@ import {
   FIDUCIAL_CENTERS,
   FIDUCIAL_SIZE,
 } from '../sheets/sheetLayouts';
-import { computePaperGrade, normalizeNumericAnswer } from './grading';
+import {
+  computeItemAnalysis,
+  computePaperGrade,
+  matchAnswerKey,
+  normalizeNumericAnswer,
+  syncContestMaxScore,
+} from './grading';
 import { scanSheetFromImageData } from './omrEngine';
 import { parseAnswerKeyTable } from '../utils/exportUtils';
-import { AnswerKey, Contest, SheetFormId } from '../types';
+import { AnswerKey, Contest, SheetFormId, StudentPaper } from '../types';
 
 function makeContest(formId: SheetFormId): Contest {
   return {
@@ -257,5 +263,126 @@ describe('TNCraft Sheet Geometry & OMR Grading Engine', () => {
       { a: 'T', b: 'T', c: 'F', d: 'F' },
     ]);
     expect(keys[1].shortAnswers).toEqual(['-0,6', '3,5']);
+  });
+
+  it('handles arbitrary dynamic numbers of Mã đề (1, 4, 12, 24+) safely without cross-grading unmatched codes', () => {
+    const contest = makeContest('standard_20');
+    contest.totalQuestions = 4;
+    contest.maxScore = 10;
+
+    // Generate 24 distinct exam codes (1001..1024)
+    const choices = ['A', 'B', 'C', 'D'] as const;
+    const keys24: AnswerKey[] = Array.from({ length: 24 }, (_, idx) => ({
+      id: `k_${idx}`,
+      contestId: contest.id,
+      examCode: String(1001 + idx),
+      createdAt: '2026-11-07',
+      mcqAnswers: [
+        choices[idx % 4],
+        choices[(idx + 1) % 4],
+        choices[(idx + 2) % 4],
+        'D', // Q4 intentionally identical across all 24 codes
+      ],
+      tfAnswers: [],
+      shortAnswers: [],
+    }));
+
+    // 1. Multi-code safety: blank or unknown examCode must NOT fall back to keys[0]
+    const unmatchedBlank = computePaperGrade(
+      contest,
+      keys24,
+      '100001',
+      '',
+      keys24[0].mcqAnswers,
+      [],
+      []
+    );
+    expect(unmatchedBlank.totalScore).toBe(0);
+    expect(unmatchedBlank.warnings.some((w) => w.kind === 'unmatched_key')).toBe(true);
+
+    const unmatchedWrongCode = computePaperGrade(
+      contest,
+      keys24,
+      '100002',
+      '9999',
+      keys24[0].mcqAnswers,
+      [],
+      []
+    );
+    expect(unmatchedWrongCode.totalScore).toBe(0);
+    expect(unmatchedWrongCode.warnings.some((w) => w.kind === 'unmatched_key')).toBe(true);
+
+    // 2. Single-code convenience: when a contest has ONLY 1 Mã đề, blank code falls back with a warning
+    const singleKeyGrade = computePaperGrade(
+      contest,
+      [keys24[0]],
+      '100003',
+      '',
+      keys24[0].mcqAnswers,
+      [],
+      []
+    );
+    expect(singleKeyGrade.totalScore).toBe(10);
+    expect(singleKeyGrade.warnings.some((w) => w.kind === 'unmatched_key')).toBe(true);
+
+    // 3. Leading-zero equivalence ("0101" sheet bubble vs "101" imported Excel code)
+    const key3Digit: AnswerKey = { ...keys24[0], examCode: '101' };
+    expect(matchAnswerKey([key3Digit, { ...keys24[1], examCode: '102' }], '0101').exact).toBe(
+      true
+    );
+
+    // 4. Item analysis across shuffled multi-code keys shows "Đa mã" on shuffled items and exact key on shared items
+    const p1: StudentPaper = {
+      id: 'p1',
+      contestId: contest.id,
+      scannedAt: '2026-11-07T10:00:00Z',
+      sbd: '100001',
+      examCode: '1001',
+      studentId: null,
+      studentName: '',
+      roomName: '',
+      mcqAnswers: keys24[0].mcqAnswers,
+      tfAnswers: [],
+      shortAnswers: [],
+      part4EssayScore: 0,
+      ...computePaperGrade(contest, keys24, '100001', '1001', keys24[0].mcqAnswers, [], []),
+    };
+    const p2: StudentPaper = {
+      id: 'p2',
+      contestId: contest.id,
+      scannedAt: '2026-11-07T10:01:00Z',
+      sbd: '100002',
+      examCode: '1019',
+      studentId: null,
+      studentName: '',
+      roomName: '',
+      mcqAnswers: keys24[18].mcqAnswers,
+      tfAnswers: [],
+      shortAnswers: [],
+      part4EssayScore: 0,
+      ...computePaperGrade(contest, keys24, '100002', '1019', keys24[18].mcqAnswers, [], []),
+    };
+
+    const allStats = computeItemAnalysis(contest, keys24, [p1, p2], 'ALL');
+    expect(allStats[0].correctKey).toBe('Đa mã');
+    expect(allStats[3].correctKey).toBe('D');
+    expect(allStats[0].correctPct).toBe(100);
+
+    const code1019Stats = computeItemAnalysis(contest, keys24, [p1, p2], '1019');
+    expect(code1019Stats[0].correctKey).toBe(keys24[18].mcqAnswers[0]);
+    expect(code1019Stats[0].totalGraded).toBe(1);
+
+    // 5. syncContestMaxScore keeps BGD-2025 maxScore aligned when part counts change
+    const bgd = makeContest('bgd_2025');
+    const synced = syncContestMaxScore({
+      ...bgd,
+      part1TotalScore: 3,
+      part2Questions: 2,
+      part2Score4: 1,
+      part3TotalScore: 2,
+      enablePart4Essay: true,
+      part4MaxScore: 3,
+    });
+    expect(synced.maxScore).toBe(10);
   });
 });

@@ -9,7 +9,7 @@ import {
   TFQuestionAnswer,
 } from '../types';
 import { computeItemAnalysis } from '../omr/grading';
-import { parseXlsxFirstSheet } from './xlsxParser';
+import { parseDocxAllTables, parseXlsxAllSheets } from './xlsxParser';
 
 function escapeXml(str: string): string {
   return String(str)
@@ -115,11 +115,18 @@ export function exportContestCsv(contest: Contest, papers: StudentPaper[]): void
     'ChiTietTraLoi',
   ];
   const lines = [header.join(',')];
+  const p1Max = contest.formId === 'bgd_2025' ? contest.part1Questions : contest.totalQuestions;
+  const p2Max = contest.formId === 'bgd_2025' && contest.enablePart2 ? contest.part2Questions : 0;
+  const p3Max = contest.formId === 'bgd_2025' && contest.enablePart3 ? contest.part3Questions : 0;
+
   papers.forEach((p, idx) => {
     const ansSummary = [
-      p.mcqAnswers.join(''),
-      p.tfAnswers.map((t) => `${t.a}${t.b}${t.c}${t.d}`).join('|'),
-      p.shortAnswers.join('|'),
+      p.mcqAnswers.slice(0, p1Max).join(''),
+      p.tfAnswers
+        .slice(0, p2Max)
+        .map((t) => `${t.a}${t.b}${t.c}${t.d}`)
+        .join('|'),
+      p.shortAnswers.slice(0, p3Max).join('|'),
     ]
       .filter(Boolean)
       .join(' / ');
@@ -215,18 +222,39 @@ export function parseAnswerKeyTable(
     .filter((r) => r.some((c) => c !== ''));
   if (cleanRows.length === 0) return { keys: [] };
 
-  // Format 1: Column-per-ExamCode (standard Vietnamese teacher Excel format:
-  // Row 0: ["Câu\\Mã đề", "1001", "1003", ...]
-  // Row 1..N: ["1", "B", "B", ...], ["13", "ĐSĐĐ", ...], ["15", "5400", "-0,6", ...])
-  const header = cleanRows[0];
-  const codeCols: Array<{ col: number; code: string }> = [];
-  for (let c = 1; c < header.length; c++) {
-    if (/^[0-9]{2,6}$/.test(header[c])) {
-      codeCols.push({ col: c, code: header[c] });
+  // Format 1: Column-per-ExamCode (standard Vietnamese teacher Excel/Word format:
+  // Header row may be row 0 or row 1 if a title row precedes "Câu\\Mã đề | 1001 | 1003 ...")
+  let headerRowIdx = -1;
+  let codeCols: Array<{ col: number; code: string }> = [];
+
+  for (let candidateRow = 0; candidateRow < Math.min(4, cleanRows.length); candidateRow++) {
+    const row = cleanRows[candidateRow];
+    const found: Array<{ col: number; code: string }> = [];
+    for (let c = 1; c < row.length; c++) {
+      const cleanedCode = row[c].replace(/^(mã\s*đề|đề|mđ|code)\s*[:#-]?\s*/i, '').trim();
+      if (/^[0-9]{1,6}$/.test(cleanedCode)) {
+        found.push({ col: c, code: cleanedCode });
+      }
+    }
+    // Verify at least one subsequent row has valid MCQ/TF/Short answers under those columns
+    if (found.length > 0 && candidateRow + 1 < cleanRows.length) {
+      const nextVals = found
+        .map(({ col }) => cleanRows[candidateRow + 1][col] || '')
+        .filter(Boolean);
+      const looksLikeAnswers =
+        nextVals.length > 0 &&
+        nextVals.every(
+          (v) => /^[A-E]$/i.test(v) || parseTfToken(v) !== null || isShortNumericToken(v)
+        );
+      if (looksLikeAnswers) {
+        headerRowIdx = candidateRow;
+        codeCols = found;
+        break;
+      }
     }
   }
 
-  if (codeCols.length > 0 && cleanRows.length >= 2) {
+  if (headerRowIdx >= 0 && codeCols.length > 0) {
     const parsedPerCode = codeCols.map(({ code }) => ({
       examCode: code,
       mcq: [] as MCQChoice[],
@@ -234,9 +262,8 @@ export function parseAnswerKeyTable(
       short: [] as string[],
     }));
 
-    for (let rIdx = 1; rIdx < cleanRows.length; rIdx++) {
+    for (let rIdx = headerRowIdx + 1; rIdx < cleanRows.length; rIdx++) {
       const row = cleanRows[rIdx];
-      // Classify row using non-empty values across code columns
       const sampleVals = codeCols.map(({ col }) => row[col] || '').filter(Boolean);
       if (sampleVals.length === 0) continue;
 
@@ -264,28 +291,27 @@ export function parseAnswerKeyTable(
       }
     }
 
-    const maxCodeLen = Math.max(...codeCols.map((c) => c.code.length));
     const p1Len = parsedPerCode[0]?.mcq.length || 0;
     const p2Len = parsedPerCode[0]?.tf.length || 0;
     const p3Len = parsedPerCode[0]?.short.length || 0;
+    if (p1Len === 0 && p2Len === 0 && p3Len === 0) {
+      return { keys: [] };
+    }
 
+    const maxCodeLen = Math.max(...codeCols.map((c) => c.code.length));
     const contestPatch: Partial<Contest> = {};
-    if (maxCodeLen >= 4 && contest.examCodeDigits !== 4) {
+    if (maxCodeLen >= 4) {
       contestPatch.examCodeDigits = 4;
+    } else if (maxCodeLen === 3 && contest.formId !== 'bgd_2025') {
+      contestPatch.examCodeDigits = 3;
     }
     if (contest.formId === 'bgd_2025') {
-      if (p1Len > 0) {
-        contestPatch.enablePart1 = true;
-        contestPatch.part1Questions = p1Len;
-      }
-      if (p2Len > 0) {
-        contestPatch.enablePart2 = true;
-        contestPatch.part2Questions = p2Len;
-      }
-      if (p3Len > 0) {
-        contestPatch.enablePart3 = true;
-        contestPatch.part3Questions = p3Len;
-      }
+      contestPatch.enablePart1 = p1Len > 0;
+      if (p1Len > 0) contestPatch.part1Questions = p1Len;
+      contestPatch.enablePart2 = p2Len > 0;
+      if (p2Len > 0) contestPatch.part2Questions = p2Len;
+      contestPatch.enablePart3 = p3Len > 0;
+      if (p3Len > 0) contestPatch.part3Questions = p3Len;
     } else if (p1Len > 0) {
       contestPatch.totalQuestions = p1Len;
     }
@@ -359,17 +385,73 @@ export async function parseAnswerKeyBuffer(
   contest: Contest
 ): Promise<ParsedKeyImportResult> {
   const lower = fileName.toLowerCase();
+  let tables: string[][][] = [];
+
   if (lower.endsWith('.xlsx')) {
-    const rows = await parseXlsxFirstSheet(buffer);
-    return parseAnswerKeyTable(rows, contest);
+    tables = await parseXlsxAllSheets(buffer);
+  } else if (lower.endsWith('.docx')) {
+    tables = await parseDocxAllTables(buffer);
+  } else {
+    const text = new TextDecoder('utf-8').decode(buffer);
+    const lines = text
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    tables = [lines.map((l) => l.split(/[,;\t]/).map((c) => c.replace(/^"|"$/g, '').trim()))];
   }
-  const text = new TextDecoder('utf-8').decode(buffer);
-  const lines = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
-  const rows = lines.map((l) => l.split(/[,;\t]/).map((c) => c.replace(/^"|"$/g, '').trim()));
-  return parseAnswerKeyTable(rows, contest);
+
+  const byCode = new Map<string, Omit<AnswerKey, 'id' | 'createdAt'>>();
+
+  for (const tbl of tables) {
+    const { keys } = parseAnswerKeyTable(tbl, contest);
+    if (keys.length === 0) continue;
+    for (const k of keys) {
+      const code = k.examCode.trim();
+      const prev = byCode.get(code);
+      if (!prev) {
+        byCode.set(code, k);
+      } else {
+        byCode.set(code, {
+          ...prev,
+          mcqAnswers: k.mcqAnswers.length > 0 ? k.mcqAnswers : prev.mcqAnswers,
+          tfAnswers: k.tfAnswers.length > 0 ? k.tfAnswers : prev.tfAnswers,
+          shortAnswers: k.shortAnswers.length > 0 ? k.shortAnswers : prev.shortAnswers,
+        });
+      }
+    }
+  }
+
+  const mergedKeys = [...byCode.values()].sort((a, b) =>
+    a.examCode.localeCompare(b.examCode, undefined, { numeric: true })
+  );
+
+  const mergedPatch: Partial<Contest> = {};
+  if (mergedKeys.length > 0) {
+    const maxCodeLen = Math.max(...mergedKeys.map((k) => k.examCode.length));
+    if (maxCodeLen >= 4) {
+      mergedPatch.examCodeDigits = 4;
+    } else if (maxCodeLen === 3 && contest.formId !== 'bgd_2025') {
+      mergedPatch.examCodeDigits = 3;
+    }
+    const maxP1 = Math.max(...mergedKeys.map((k) => k.mcqAnswers.length));
+    const maxP2 = Math.max(...mergedKeys.map((k) => k.tfAnswers.length));
+    const maxP3 = Math.max(...mergedKeys.map((k) => k.shortAnswers.length));
+    if (contest.formId === 'bgd_2025') {
+      mergedPatch.enablePart1 = maxP1 > 0;
+      if (maxP1 > 0) mergedPatch.part1Questions = maxP1;
+      mergedPatch.enablePart2 = maxP2 > 0;
+      if (maxP2 > 0) mergedPatch.part2Questions = maxP2;
+      mergedPatch.enablePart3 = maxP3 > 0;
+      if (maxP3 > 0) mergedPatch.part3Questions = maxP3;
+    } else if (maxP1 > 0) {
+      mergedPatch.totalQuestions = maxP1;
+    }
+  }
+
+  return {
+    keys: mergedKeys,
+    contestPatch: Object.keys(mergedPatch).length > 0 ? mergedPatch : undefined,
+  };
 }
 
 export async function generateKeyQrDataUrl(key: AnswerKey): Promise<string> {
@@ -390,27 +472,37 @@ export function decodeKeyQrPayload(
   try {
     const obj = JSON.parse(raw);
     if (!obj || typeof obj.c !== 'string') return null;
-    const qLen = contest.formId === 'bgd_2025' ? contest.part1Questions : contest.totalQuestions;
+    const defaultQLen =
+      contest.formId === 'bgd_2025' ? contest.part1Questions : contest.totalQuestions;
+    const qLen = typeof obj.m === 'string' && obj.m.length > 0 ? obj.m.length : defaultQLen;
     const mcqAnswers: MCQChoice[] = Array.from({ length: qLen }, (_, i) => {
       const ch = obj.m?.[i] || '';
       return ['A', 'B', 'C', 'D', 'E'].includes(ch) ? (ch as MCQChoice) : '';
     });
-    const tfAnswers: TFQuestionAnswer[] = Array.from(
-      { length: contest.formId === 'bgd_2025' ? contest.part2Questions : 0 },
-      (_, i) => {
-        const s = obj.t?.[i] || '____';
-        const mapCh = (c: string) => (c === 'T' || c === 'F' ? c : '');
-        return {
-          a: mapCh(s[0]),
-          b: mapCh(s[1]),
-          c: mapCh(s[2]),
-          d: mapCh(s[3]),
-        };
-      }
-    );
-    const shortAnswers: string[] = Array.from(
-      { length: contest.formId === 'bgd_2025' ? contest.part3Questions : 0 },
-      (_, i) => String(obj.s?.[i] ?? '')
+    const tfLen =
+      Array.isArray(obj.t) && obj.t.length > 0
+        ? obj.t.length
+        : contest.formId === 'bgd_2025'
+          ? contest.part2Questions
+          : 0;
+    const tfAnswers: TFQuestionAnswer[] = Array.from({ length: tfLen }, (_, i) => {
+      const s = obj.t?.[i] || '____';
+      const mapCh = (c: string) => (c === 'T' || c === 'F' ? c : '');
+      return {
+        a: mapCh(s[0]),
+        b: mapCh(s[1]),
+        c: mapCh(s[2]),
+        d: mapCh(s[3]),
+      };
+    });
+    const shortLen =
+      Array.isArray(obj.s) && obj.s.length > 0
+        ? obj.s.length
+        : contest.formId === 'bgd_2025'
+          ? contest.part3Questions
+          : 0;
+    const shortAnswers: string[] = Array.from({ length: shortLen }, (_, i) =>
+      String(obj.s?.[i] ?? '')
     );
     return {
       contestId: contest.id,

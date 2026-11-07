@@ -10,7 +10,12 @@ import {
   TFChoice,
   TFQuestionAnswer,
 } from '../types';
-import { computePaperGrade, normalizeNumericAnswer, resolveStudentFromRoster } from '../omr/grading';
+import {
+  computePaperGrade,
+  matchAnswerKey,
+  normalizeNumericAnswer,
+  resolveStudentFromRoster,
+} from '../omr/grading';
 import { loadPaperImage } from '../storage/db';
 
 interface Props {
@@ -34,16 +39,33 @@ export const PaperRepairModal: React.FC<Props> = ({
   onClose,
   onSave,
 }) => {
+  const mcqLen =
+    contest.formId === 'bgd_2025'
+      ? contest.enablePart1
+        ? contest.part1Questions
+        : 0
+      : contest.totalQuestions;
+  const tfLen =
+    contest.formId === 'bgd_2025' && contest.enablePart2 ? contest.part2Questions : 0;
+  const shortLen =
+    contest.formId === 'bgd_2025' && contest.enablePart3 ? contest.part3Questions : 0;
+
   const [sbd, setSbd] = useState(paper.sbd);
   const [examCode, setExamCode] = useState(paper.examCode);
   const [studentName, setStudentName] = useState(paper.studentName);
   const [roomName, setRoomName] = useState(paper.roomName);
   const [essayScore, setEssayScore] = useState<number>(paper.part4EssayScore || 0);
-  const [mcqAnswers, setMcqAnswers] = useState<MCQChoice[]>([...paper.mcqAnswers]);
-  const [tfAnswers, setTfAnswers] = useState<TFQuestionAnswer[]>(
-    paper.tfAnswers.map((t) => ({ ...t }))
+  const [mcqAnswers, setMcqAnswers] = useState<MCQChoice[]>(() =>
+    Array.from({ length: mcqLen }, (_, i) => paper.mcqAnswers[i] || '')
   );
-  const [shortAnswers, setShortAnswers] = useState<string[]>([...paper.shortAnswers]);
+  const [tfAnswers, setTfAnswers] = useState<TFQuestionAnswer[]>(() =>
+    Array.from({ length: tfLen }, (_, i) =>
+      paper.tfAnswers[i] ? { ...paper.tfAnswers[i] } : { a: '', b: '', c: '', d: '' }
+    )
+  );
+  const [shortAnswers, setShortAnswers] = useState<string[]>(() =>
+    Array.from({ length: shortLen }, (_, i) => paper.shortAnswers[i] || '')
+  );
   const [scanImage, setScanImage] = useState<string | null>(paper.annotatedImageDataUrl || null);
 
   useEffect(() => {
@@ -76,9 +98,7 @@ export const PaperRepairModal: React.FC<Props> = ({
     paper.id
   );
 
-  const matchedKey =
-    keys.find((k) => k.examCode.trim() === examCode.trim()) ||
-    (keys.length === 1 ? keys[0] : undefined);
+  const matchedKey = matchAnswerKey(keys, examCode).matchedKey;
 
   const opts: MCQChoice[] =
     contest.choiceCount === 5 && contest.formId !== 'bgd_2025'
@@ -93,9 +113,9 @@ export const PaperRepairModal: React.FC<Props> = ({
       examCode,
       studentName,
       roomName,
-      mcqAnswers,
-      tfAnswers,
-      shortAnswers,
+      mcqAnswers: [...mcqAnswers, ...paper.mcqAnswers.slice(mcqAnswers.length)],
+      tfAnswers: [...tfAnswers, ...paper.tfAnswers.slice(tfAnswers.length)],
+      shortAnswers: [...shortAnswers, ...paper.shortAnswers.slice(shortAnswers.length)],
       part4EssayScore: essayScore,
       ...liveGrade,
     });
@@ -172,12 +192,40 @@ export const PaperRepairModal: React.FC<Props> = ({
             </label>
             <label className="field-label">
               <span>{lang === 'vi' ? 'Mã đề' : 'Exam Code'}</span>
-              <input
-                type="text"
-                className="text-input mono-input"
-                value={examCode}
-                onChange={(e) => setExamCode(e.target.value)}
-              />
+              {keys.length > 0 ? (
+                <div className="seg-row">
+                  <input
+                    type="text"
+                    className="text-input mono-input"
+                    style={{ minWidth: 74 }}
+                    value={examCode}
+                    onChange={(e) => setExamCode(e.target.value)}
+                  />
+                  <select
+                    className="text-input"
+                    value={
+                      keys.some((k) => k.examCode === examCode.trim()) ? examCode.trim() : ''
+                    }
+                    onChange={(e) => {
+                      if (e.target.value) setExamCode(e.target.value);
+                    }}
+                  >
+                    <option value="">{lang === 'vi' ? 'Chọn mã...' : 'Pick...'}</option>
+                    {keys.map((k) => (
+                      <option key={k.id} value={k.examCode}>
+                        {k.examCode}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <input
+                  type="text"
+                  className="text-input mono-input"
+                  value={examCode}
+                  onChange={(e) => setExamCode(e.target.value)}
+                />
+              )}
             </label>
           </div>
 
@@ -200,7 +248,7 @@ export const PaperRepairModal: React.FC<Props> = ({
                 </span>
                 <input
                   type="number"
-                  step="0.25"
+                  step="0.05"
                   min={0}
                   max={contest.part4MaxScore}
                   className="text-input"

@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { AnswerKey, Classroom, Contest, Student, StudentPaper } from './types';
 import { SHEET_FORM_LABELS, t } from './i18n';
+import { computePaperGrade, syncContestMaxScore } from './omr/grading';
 import {
   AppDatabaseState,
   loadDatabaseState,
@@ -62,14 +63,41 @@ export const App: React.FC = () => {
     });
   }, [state.contests, state.classes, searchQuery]);
 
-  const upsertContest = (contest: Contest) => {
+  const upsertContest = (rawContest: Contest) => {
+    const contest = syncContestMaxScore(rawContest);
     setState((prev) => {
       const exists = prev.contests.some((c) => c.id === contest.id);
+      const nextContests = exists
+        ? prev.contests.map((c) => (c.id === contest.id ? contest : c))
+        : [contest, ...prev.contests];
+
+      // Re-grade existing papers of this contest whenever scoring weights or question counts change
+      const contestKeys = prev.keys.filter((k) => k.contestId === contest.id);
+      const contestPapers = prev.papers.filter((p) => p.contestId === contest.id);
+      const nextPapers =
+        exists && contestPapers.length > 0
+          ? prev.papers.map((p) => {
+              if (p.contestId !== contest.id) return p;
+              const g = computePaperGrade(
+                contest,
+                contestKeys,
+                p.sbd,
+                p.examCode,
+                p.mcqAnswers,
+                p.tfAnswers,
+                p.shortAnswers,
+                p.part4EssayScore,
+                contestPapers,
+                p.id
+              );
+              return { ...p, ...g };
+            })
+          : prev.papers;
+
       return {
         ...prev,
-        contests: exists
-          ? prev.contests.map((c) => (c.id === contest.id ? contest : c))
-          : [contest, ...prev.contests],
+        contests: nextContests,
+        papers: nextPapers,
       };
     });
   };
@@ -109,14 +137,107 @@ export const App: React.FC = () => {
   const upsertKey = (key: AnswerKey) => {
     setState((prev) => {
       const idx = prev.keys.findIndex(
-        (k) => k.id === key.id || (k.contestId === key.contestId && k.examCode === key.examCode)
+        (k) =>
+          k.id === key.id ||
+          (k.contestId === key.contestId && k.examCode.trim() === key.examCode.trim())
       );
+      let nextKeys: AnswerKey[];
       if (idx >= 0) {
-        const next = [...prev.keys];
-        next[idx] = { ...key, id: prev.keys[idx].id };
-        return { ...prev, keys: next };
+        nextKeys = [...prev.keys];
+        nextKeys[idx] = { ...key, id: prev.keys[idx].id };
+      } else {
+        nextKeys = [...prev.keys, key];
       }
-      return { ...prev, keys: [...prev.keys, key] };
+
+      const targetContest = prev.contests.find((c) => c.id === key.contestId);
+      if (!targetContest) return { ...prev, keys: nextKeys };
+
+      const cKeys = nextKeys.filter((k) => k.contestId === key.contestId);
+      const cPapers = prev.papers.filter((p) => p.contestId === key.contestId);
+      if (cPapers.length === 0) return { ...prev, keys: nextKeys };
+
+      const nextPapers = prev.papers.map((p) => {
+        if (p.contestId !== key.contestId) return p;
+        const g = computePaperGrade(
+          targetContest,
+          cKeys,
+          p.sbd,
+          p.examCode,
+          p.mcqAnswers,
+          p.tfAnswers,
+          p.shortAnswers,
+          p.part4EssayScore,
+          cPapers,
+          p.id
+        );
+        return { ...p, ...g };
+      });
+      return { ...prev, keys: nextKeys, papers: nextPapers };
+    });
+  };
+
+  const importKeysBatch = (
+    contestId: string,
+    importedKeys: AnswerKey[],
+    contestPatch?: Partial<Contest>
+  ) => {
+    setState((prev) => {
+      const curContest = prev.contests.find((c) => c.id === contestId);
+      if (!curContest) return prev;
+
+      const updatedContest =
+        contestPatch && Object.keys(contestPatch).length > 0
+          ? syncContestMaxScore({ ...curContest, ...contestPatch })
+          : curContest;
+
+      const nextContests = prev.contests.map((c) => (c.id === contestId ? updatedContest : c));
+      const nextKeys = [...prev.keys];
+
+      for (const item of importedKeys) {
+        const idx = nextKeys.findIndex(
+          (k) =>
+            k.id === item.id ||
+            (k.contestId === contestId && k.examCode.trim() === item.examCode.trim())
+        );
+        if (idx >= 0) {
+          nextKeys[idx] = {
+            ...item,
+            id: nextKeys[idx].id,
+            createdAt: nextKeys[idx].createdAt,
+          };
+        } else {
+          nextKeys.push(item);
+        }
+      }
+
+      const cKeys = nextKeys.filter((k) => k.contestId === contestId);
+      const cPapers = prev.papers.filter((p) => p.contestId === contestId);
+      const nextPapers =
+        cPapers.length > 0
+          ? prev.papers.map((p) => {
+              if (p.contestId !== contestId) return p;
+              const g = computePaperGrade(
+                updatedContest,
+                cKeys,
+                p.sbd,
+                p.examCode,
+                p.mcqAnswers,
+                p.tfAnswers,
+                p.shortAnswers,
+                p.part4EssayScore,
+                cPapers,
+                p.id
+              );
+              return { ...p, ...g };
+            })
+          : prev.papers;
+
+      return {
+        ...prev,
+        contests: nextContests,
+        keys: nextKeys,
+        papers: nextPapers,
+      };
     });
   };
 
@@ -176,8 +297,55 @@ export const App: React.FC = () => {
             onEditContest={() => setEditingContest(activeContest)}
             onUpdateContest={(patch) => upsertContest({ ...activeContest, ...patch })}
             onUpsertKey={upsertKey}
+            onImportKeysBatch={(imported, patch) =>
+              importKeysBatch(activeContest.id, imported, patch)
+            }
             onDeleteKey={(kid) =>
-              setState((prev) => ({ ...prev, keys: prev.keys.filter((k) => k.id !== kid) }))
+              setState((prev) => {
+                const nextKeys = prev.keys.filter((k) => k.id !== kid);
+                const cKeys = nextKeys.filter((k) => k.contestId === activeContest.id);
+                const cPapers = prev.papers.filter((p) => p.contestId === activeContest.id);
+                const nextPapers = prev.papers.map((p) => {
+                  if (p.contestId !== activeContest.id) return p;
+                  const g = computePaperGrade(
+                    activeContest,
+                    cKeys,
+                    p.sbd,
+                    p.examCode,
+                    p.mcqAnswers,
+                    p.tfAnswers,
+                    p.shortAnswers,
+                    p.part4EssayScore,
+                    cPapers,
+                    p.id
+                  );
+                  return { ...p, ...g };
+                });
+                return { ...prev, keys: nextKeys, papers: nextPapers };
+              })
+            }
+            onClearKeys={() =>
+              setState((prev) => {
+                const nextKeys = prev.keys.filter((k) => k.contestId !== activeContest.id);
+                const cPapers = prev.papers.filter((p) => p.contestId === activeContest.id);
+                const nextPapers = prev.papers.map((p) => {
+                  if (p.contestId !== activeContest.id) return p;
+                  const g = computePaperGrade(
+                    activeContest,
+                    [],
+                    p.sbd,
+                    p.examCode,
+                    p.mcqAnswers,
+                    p.tfAnswers,
+                    p.shortAnswers,
+                    p.part4EssayScore,
+                    cPapers,
+                    p.id
+                  );
+                  return { ...p, ...g };
+                });
+                return { ...prev, keys: nextKeys, papers: nextPapers };
+              })
             }
             onUpsertPaper={upsertPaper}
             onDeletePaper={(pid) =>

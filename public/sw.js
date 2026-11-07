@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tncraft-pwa-v3';
+const CACHE_NAME = 'tncraft-pwa-v4';
 const RELATIVE_SHELL = [
   './',
   './index.html',

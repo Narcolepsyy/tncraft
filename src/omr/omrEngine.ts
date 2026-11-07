@@ -14,7 +14,12 @@ import {
   CANONICAL_W,
   FIDUCIAL_CENTERS,
 } from '../sheets/sheetLayouts';
-import { computePaperGrade, GradeComputation, normalizeNumericAnswer } from './grading';
+import {
+  computePaperGrade,
+  GradeComputation,
+  matchAnswerKey,
+  normalizeNumericAnswer,
+} from './grading';
 
 export interface CornerQuad {
   tl: Point2D;
@@ -682,9 +687,10 @@ function scanMinistryBgdSheet(
   const p1Starts = [92.5, 327.5, 559.5, 793.5];
   const choices: MCQChoice[] = ['A', 'B', 'C', 'D'];
   const p1Count = contest.enablePart1 ? Math.min(40, contest.part1Questions) : 0;
+  const p1ScanLimit = contest.enablePart1 ? (keys.length === 0 ? 40 : p1Count) : 0;
   const mcqAnswers: MCQChoice[] = [];
 
-  for (let q = 0; q < p1Count; q++) {
+  for (let q = 0; q < p1ScanLimit; q++) {
     const block = Math.floor(q / 10);
     const row = q % 10;
     const cy = 113.2 + row * 24.0;
@@ -694,18 +700,28 @@ function scanMinistryBgdSheet(
       const cx = p1Starts[block] + oi * 47.0;
       const sc = measureCircleFill(bodyThresh, BODY_W, BODY_H, cx, cy, 6.5);
       group.push({ value: choices[oi], score: sc });
-      overlayBubbles.push({
-        id: `m_mcq_${q}_${choices[oi]}`,
-        section: 'mcq',
-        index: q,
-        value: choices[oi],
-        cx,
-        cy: HEADER_H + cy,
-        r: 8.5,
-      });
     }
     const res = pickMarkedChoice(group, settings.eraseMode);
-    mcqAnswers.push((res.value as MCQChoice) || '');
+    const picked = (res.value as MCQChoice) || '';
+    mcqAnswers.push(picked);
+
+    if (q < p1Count || picked !== '') {
+      for (let oi = 0; oi < 4; oi++) {
+        const cx = p1Starts[block] + oi * 47.0;
+        overlayBubbles.push({
+          id: `m_mcq_${q}_${choices[oi]}`,
+          section: 'mcq',
+          index: q,
+          value: choices[oi],
+          cx,
+          cy: HEADER_H + cy,
+          r: 8.5,
+        });
+      }
+    }
+  }
+  while (mcqAnswers.length > p1Count && mcqAnswers[mcqAnswers.length - 1] === '') {
+    mcqAnswers.pop();
   }
 
   // 4. Decode Part II (True/False up to 8)
@@ -713,7 +729,8 @@ function scanMinistryBgdSheet(
   if (contest.enablePart2) {
     const subKeys: Array<keyof TFQuestionAnswer> = ['a', 'b', 'c', 'd'];
     const p2Count = Math.min(8, contest.part2Questions);
-    for (let q = 0; q < p2Count; q++) {
+    const p2ScanLimit = keys.length === 0 ? 8 : p2Count;
+    for (let q = 0; q < p2ScanLimit; q++) {
       const block = Math.floor(q / 2);
       const sub = q % 2;
       const tx = p1Starts[block] + sub * 2 * 47.0;
@@ -732,31 +749,45 @@ function scanMinistryBgdSheet(
           settings.eraseMode
         );
         item[subKeys[sIdx]] = (res.value as TFChoice) || '';
-
-        overlayBubbles.push(
-          {
-            id: `m_tf_${q}_${sIdx}_T`,
-            section: 'tf',
-            index: q,
-            subIndex: sIdx,
-            value: 'T',
-            cx: tx,
-            cy: HEADER_H + cy,
-            r: 8.5,
-          },
-          {
-            id: `m_tf_${q}_${sIdx}_F`,
-            section: 'tf',
-            index: q,
-            subIndex: sIdx,
-            value: 'F',
-            cx: fx,
-            cy: HEADER_H + cy,
-            r: 8.5,
-          }
-        );
+      }
+      const hasAnyTf = item.a !== '' || item.b !== '' || item.c !== '' || item.d !== '';
+      if (q < p2Count || hasAnyTf) {
+        for (let sIdx = 0; sIdx < 4; sIdx++) {
+          const cy = 461.0 + sIdx * 24.2;
+          overlayBubbles.push(
+            {
+              id: `m_tf_${q}_${sIdx}_T`,
+              section: 'tf',
+              index: q,
+              subIndex: sIdx,
+              value: 'T',
+              cx: tx,
+              cy: HEADER_H + cy,
+              r: 8.5,
+            },
+            {
+              id: `m_tf_${q}_${sIdx}_F`,
+              section: 'tf',
+              index: q,
+              subIndex: sIdx,
+              value: 'F',
+              cx: fx,
+              cy: HEADER_H + cy,
+              r: 8.5,
+            }
+          );
+        }
       }
       tfAnswers.push(item);
+    }
+    while (
+      tfAnswers.length > p2Count &&
+      tfAnswers[tfAnswers.length - 1].a === '' &&
+      tfAnswers[tfAnswers.length - 1].b === '' &&
+      tfAnswers[tfAnswers.length - 1].c === '' &&
+      tfAnswers[tfAnswers.length - 1].d === ''
+    ) {
+      tfAnswers.pop();
     }
   }
 
@@ -764,9 +795,11 @@ function scanMinistryBgdSheet(
   const shortAnswers: string[] = [];
   if (contest.enablePart3) {
     const p3Count = Math.min(6, contest.part3Questions);
-    for (let q = 0; q < p3Count; q++) {
+    const p3ScanLimit = keys.length === 0 ? 6 : p3Count;
+    for (let q = 0; q < p3ScanLimit; q++) {
       const qx = 79.0 + q * 150.8;
       let str = '';
+      const qOverlays: typeof overlayBubbles = [];
       for (let col = 0; col < 4; col++) {
         const cx = qx + col * 32.6;
         const group: Array<{ value: string; score: number }> = [];
@@ -777,7 +810,7 @@ function scanMinistryBgdSheet(
             value: '-',
             score: measureCircleFill(bodyThresh, BODY_W, BODY_H, cx, cyMinus, 6.2),
           });
-          overlayBubbles.push({
+          qOverlays.push({
             id: `m_short_${q}_0_-`,
             section: 'short',
             index: q,
@@ -795,7 +828,7 @@ function scanMinistryBgdSheet(
             value: ',',
             score: measureCircleFill(bodyThresh, BODY_W, BODY_H, cx, cyComma, 6.2),
           });
-          overlayBubbles.push({
+          qOverlays.push({
             id: `m_short_${q}_${col}_,`,
             section: 'short',
             index: q,
@@ -813,7 +846,7 @@ function scanMinistryBgdSheet(
             value: String(d),
             score: measureCircleFill(bodyThresh, BODY_W, BODY_H, cx, cyDigit, 6.2),
           });
-          overlayBubbles.push({
+          qOverlays.push({
             id: `m_short_${q}_${col}_${d}`,
             section: 'short',
             index: q,
@@ -829,7 +862,13 @@ function scanMinistryBgdSheet(
         if (res.multi) str += '?';
         else if (res.value) str += res.value;
       }
+      if (q < p3Count || str !== '') {
+        overlayBubbles.push(...qOverlays);
+      }
       shortAnswers.push(str);
+    }
+    while (shortAnswers.length > p3Count && shortAnswers[shortAnswers.length - 1] === '') {
+      shortAnswers.pop();
     }
   }
 
@@ -1095,9 +1134,7 @@ function renderAnnotatedOverlay(
   const imgData = new ImageData(new Uint8ClampedArray(warpedRgba), CANONICAL_W, CANONICAL_H);
   ctx.putImageData(imgData, 0, 0);
 
-  const matchedKey =
-    keys.find((k) => k.examCode.trim() === examCode.trim()) ||
-    (keys.length === 1 ? keys[0] : undefined);
+  const { matchedKey } = matchAnswerKey(keys, examCode);
 
   for (const b of bubbles) {
     if (b.section === 'sbd' && sbd[b.index] === b.value) {
@@ -1108,8 +1145,9 @@ function renderAnnotatedOverlay(
       const sAns = mcqAnswers[b.index] || '';
       const kAns = matchedKey?.mcqAnswers[b.index] || '';
       if (sAns === b.value) {
-        drawRing(ctx, b.cx, b.cy, b.r + 2.5, sAns === kAns ? '#16a34a' : '#dc2626', 3);
-      } else if (kAns === b.value && sAns !== kAns) {
+        const color = !matchedKey || !kAns ? '#d97706' : sAns === kAns ? '#16a34a' : '#dc2626';
+        drawRing(ctx, b.cx, b.cy, b.r + 2.5, color, 3);
+      } else if (matchedKey && kAns === b.value && sAns !== kAns) {
         drawRing(ctx, b.cx, b.cy, b.r + 2.5, '#0ea5e9', 2.5, true);
       }
     } else if (b.section === 'tf') {
@@ -1118,19 +1156,22 @@ function renderAnnotatedOverlay(
       const sAns = tfAnswers[b.index]?.[sk] || '';
       const kAns = matchedKey?.tfAnswers[b.index]?.[sk] || '';
       if (sAns === b.value) {
-        drawRing(ctx, b.cx, b.cy, b.r + 2.5, sAns === kAns ? '#16a34a' : '#dc2626', 3);
-      } else if (kAns === b.value && sAns !== kAns) {
+        const color = !matchedKey || !kAns ? '#d97706' : sAns === kAns ? '#16a34a' : '#dc2626';
+        drawRing(ctx, b.cx, b.cy, b.r + 2.5, color, 3);
+      } else if (matchedKey && kAns === b.value && sAns !== kAns) {
         drawRing(ctx, b.cx, b.cy, b.r + 2.5, '#0ea5e9', 2.2, true);
       }
     } else if (b.section === 'short') {
       const sRaw = shortAnswers[b.index] || '';
       const kRaw = matchedKey?.shortAnswers[b.index] || '';
+      const hasKey = Boolean(matchedKey && kRaw);
       const isCorrect =
         Boolean(sRaw) &&
-        Boolean(kRaw) &&
+        hasKey &&
         normalizeNumericAnswer(sRaw) === normalizeNumericAnswer(kRaw);
       if (sRaw[b.subIndex ?? 0] === b.value) {
-        drawRing(ctx, b.cx, b.cy, b.r + 2, isCorrect ? '#16a34a' : '#dc2626', 2.6);
+        const color = !hasKey ? '#d97706' : isCorrect ? '#16a34a' : '#dc2626';
+        drawRing(ctx, b.cx, b.cy, b.r + 2, color, 2.6);
       }
     }
   }
