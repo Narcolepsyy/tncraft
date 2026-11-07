@@ -1,11 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
+  Aperture,
   Camera,
   CameraOff,
   Check,
   Crop,
   ImagePlus,
+  Play,
+  RefreshCw,
   RotateCcw,
   Sparkles,
 } from 'lucide-react';
@@ -52,11 +55,16 @@ export const ScannerPanel: React.FC<Props> = ({
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const nativeCameraInputRef = useRef<HTMLInputElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const mountedRef = useRef<boolean>(true);
   const stableFramesRef = useRef<number>(0);
 
   const [cameraActive, setCameraActive] = useState(false);
+  const [cameraStarting, setCameraStarting] = useState(false);
+  const [needsManualPlayTap, setNeedsManualPlayTap] = useState(false);
+  const [facingMode, setFacingMode] = useState<'environment' | 'user'>('environment');
   const [cameraError, setCameraError] = useState<string>('');
   const [lockedCorners, setLockedCorners] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
@@ -77,54 +85,250 @@ export const ScannerPanel: React.FC<Props> = ({
 
   const stopCamera = () => {
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach((tr) => tr.stop());
+      streamRef.current.getTracks().forEach((track) => {
+        track.onended = null;
+        track.stop();
+      });
       streamRef.current = null;
     }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
     setCameraActive(false);
+    setCameraStarting(false);
+    setNeedsManualPlayTap(false);
     setLockedCorners(false);
     stableFramesRef.current = 0;
   };
 
   useEffect(() => {
-    return () => stopCamera();
+    mountedRef.current = true;
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && streamRef.current) {
+        const dead = streamRef.current
+          .getVideoTracks()
+          .every((tr) => tr.readyState === 'ended');
+        if (dead) {
+          stopCamera();
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      mountedRef.current = false;
+      document.removeEventListener('visibilitychange', handleVisibility);
+      stopCamera();
+    };
   }, []);
 
-  const startCamera = async () => {
+  const requestCameraStreamWithFallback = async (
+    desiredFacing: 'environment' | 'user'
+  ): Promise<MediaStream> => {
+    const attempts: MediaStreamConstraints[] = [
+      {
+        audio: false,
+        video: {
+          facingMode: { ideal: desiredFacing },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
+      },
+      {
+        audio: false,
+        video: {
+          facingMode: desiredFacing,
+        },
+      },
+      {
+        audio: false,
+        video: true,
+      },
+    ];
+
+    let lastErr: any = null;
+    for (const constraints of attempts) {
+      try {
+        if (navigator.mediaDevices?.getUserMedia) {
+          return await navigator.mediaDevices.getUserMedia(constraints);
+        }
+        const legacyGetUserMedia =
+          (navigator as any).webkitGetUserMedia || (navigator as any).mozGetUserMedia;
+        if (legacyGetUserMedia) {
+          return await new Promise<MediaStream>((resolve, reject) =>
+            legacyGetUserMedia.call(navigator, constraints, resolve, reject)
+          );
+        }
+        throw new Error('MEDIA_DEVICES_UNAVAILABLE');
+      } catch (err: any) {
+        lastErr = err;
+        const name = err?.name || '';
+        // Do not re-prompt if user or browser explicitly denied permission
+        if (
+          name === 'NotAllowedError' ||
+          name === 'PermissionDeniedError' ||
+          name === 'SecurityError'
+        ) {
+          throw err;
+        }
+      }
+    }
+    throw lastErr || new Error('Camera unavailable');
+  };
+
+  const formatCameraErrorMessage = (err: any): string => {
+    const name = err?.name || '';
+    const ua = navigator.userAgent || '';
+    const isInAppWebView = /FBAN|FBAV|Messenger|Zalo|Instagram|Line|TikTok/i.test(ua);
+
+    if (isInAppWebView) {
+      return lang === 'vi'
+        ? 'Trình duyệt trong ứng dụng (Zalo / Messenger / Facebook) đang chặn Camera trực tiếp. Hãy nhấn mở bằng trình duyệt Safari/Chrome, HOẶC bấm nút "Chụp bằng Camera Gốc (Nét cao)" ngay bên dưới!'
+        : 'In-app browser (Messenger / Zalo / Facebook) blocks live WebRTC camera. Open this link in Safari/Chrome, OR tap "Snap with Native Camera (HD)" right below!';
+    }
+
+    if (
+      name === 'NotAllowedError' ||
+      name === 'PermissionDeniedError' ||
+      name === 'SecurityError'
+    ) {
+      return lang === 'vi'
+        ? 'Quyền truy cập Camera đang bị chặn. Trên iPhone: bấm biểu tượng "aA" (hoặc biểu tượng trang web) trên thanh địa chỉ Safari → Cài đặt trang web → Camera → Cho phép (hoặc vào Cài đặt iPhone → Safari → Camera → Cho phép). Bạn cũng có thể bấm "Chụp bằng Camera Gốc" bên dưới để chụp ngay!'
+        : 'Camera permission was denied. On iPhone Safari: tap "aA" (or the page settings icon) in the address bar → Website Settings → Camera → Allow (or iPhone Settings → Safari → Camera → Allow). You can also tap "Snap with Native Camera (HD)" below right away!';
+    }
+
+    if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+      return lang === 'vi'
+        ? 'Không tìm thấy thiết bị Camera trên máy này. Hãy dùng nút "Chọn ảnh có sẵn trong máy" bên dưới.'
+        : 'No camera device found on this device. Please use "Choose Photo from Library" below.';
+    }
+
+    if (name === 'NotReadableError' || name === 'TrackStartError') {
+      return lang === 'vi'
+        ? 'Camera đang bận bởi ứng dụng khác. Hãy đóng các tab/ứng dụng đang dùng camera rồi thử lại, hoặc bấm "Chụp bằng Camera Gốc".'
+        : 'Camera is currently in use by another app/tab. Close other camera apps and retry, or tap "Snap with Native Camera (HD)".';
+    }
+
+    if (!window.isSecureContext) {
+      return lang === 'vi'
+        ? 'Trình duyệt yêu cầu kết nối HTTPS an toàn để mở camera trực tiếp. Hãy mở link https:// hoặc dùng nút "Chụp bằng Camera Gốc" bên dưới!'
+        : 'Live camera requires HTTPS. Please open via https:// or tap "Snap with Native Camera (HD)" below!';
+    }
+
+    return (
+      (lang === 'vi'
+        ? 'Không thể khởi động camera trực tiếp: '
+        : 'Could not start live camera: ') + (err?.message || name || 'Unknown error')
+    );
+  };
+
+  const startCamera = async (overrideFacing?: 'environment' | 'user') => {
+    const desiredFacing = overrideFacing || facingMode;
     setCameraError('');
     setScanResult(null);
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setCameraError(
-        lang === 'vi'
-          ? 'Trình duyệt yêu cầu HTTPS để mở camera trực tiếp. Bạn có thể bấm "Chọn ảnh / Chụp nét cao" để chụp bằng Camera iPhone ngay lập tức!'
-          : 'Live camera stream requires HTTPS on iOS. Tap "Scan Photo / High-Res Camera" below to snap directly with your iPhone Camera!'
-      );
+
+    if (
+      !navigator.mediaDevices?.getUserMedia &&
+      !(navigator as any).webkitGetUserMedia
+    ) {
+      setCameraError(formatCameraErrorMessage(new Error('MEDIA_DEVICES_UNAVAILABLE')));
       return;
     }
 
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          facingMode: { ideal: 'environment' },
-          width: { ideal: 1920 },
-          height: { ideal: 2560 },
-        },
-      });
-      streamRef.current = stream;
-      setCameraActive(true);
-      requestAnimationFrame(() => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.play().catch(() => {});
-        }
-      });
-    } catch (err: any) {
-      setCameraError(
-        (lang === 'vi'
-          ? 'Không thể mở camera trực tiếp: '
-          : 'Could not open live camera: ') + (err?.message || 'Permission denied')
-      );
+    // Stop any previous stream first
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((tr) => tr.stop());
+      streamRef.current = null;
     }
+
+    // Prime the already-mounted <video> element synchronously inside the user tap gesture
+    // AND make the container visible immediately so iOS WebKit never sees a 0x0 hidden video.
+    const vid = videoRef.current;
+    if (vid) {
+      vid.muted = true;
+      vid.defaultMuted = true;
+      vid.playsInline = true;
+      vid.autoplay = true;
+      vid.setAttribute('playsinline', 'true');
+      vid.setAttribute('webkit-playsinline', 'true');
+      vid.setAttribute('muted', 'true');
+      vid.setAttribute('autoplay', 'true');
+    }
+
+    setFacingMode(desiredFacing);
+    setCameraActive(true);
+    setCameraStarting(true);
+    setNeedsManualPlayTap(false);
+
+    try {
+      const stream = await requestCameraStreamWithFallback(desiredFacing);
+      if (!mountedRef.current) {
+        stream.getTracks().forEach((tr) => tr.stop());
+        return;
+      }
+
+      stream.getVideoTracks().forEach((track) => {
+        track.onended = () => {
+          if (mountedRef.current) stopCamera();
+        };
+      });
+
+      streamRef.current = stream;
+      const videoEl = videoRef.current;
+      if (!videoEl) {
+        stopCamera();
+        return;
+      }
+
+      videoEl.srcObject = stream;
+
+      // Wait briefly for metadata if needed, then start playback
+      if (videoEl.readyState < 1) {
+        await new Promise<void>((resolve) => {
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            videoEl.removeEventListener('loadedmetadata', finish);
+            resolve();
+          };
+          videoEl.addEventListener('loadedmetadata', finish);
+          window.setTimeout(finish, 1200);
+        });
+      }
+
+      try {
+        await videoEl.play();
+        setCameraStarting(false);
+        setNeedsManualPlayTap(false);
+      } catch {
+        // Strict WebView blocked post-permission play(); offer a 1-tap synchronous play button
+        setCameraStarting(false);
+        setNeedsManualPlayTap(true);
+      }
+    } catch (err: any) {
+      stopCamera();
+      setCameraError(formatCameraErrorMessage(err));
+    }
+  };
+
+  const handleFlipCamera = () => {
+    const next = facingMode === 'environment' ? 'user' : 'environment';
+    startCamera(next);
+  };
+
+  const handleManualPlayTap = () => {
+    const vid = videoRef.current;
+    if (!vid) return;
+    vid.muted = true;
+    vid
+      .play()
+      .then(() => {
+        setNeedsManualPlayTap(false);
+        setCameraStarting(false);
+      })
+      .catch((err) => {
+        setCameraError(formatCameraErrorMessage(err));
+      });
   };
 
   // Real-time viewfinder corner detection loop
@@ -229,23 +433,30 @@ export const ScannerPanel: React.FC<Props> = ({
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const maxDim = 2000;
-        const ratio = Math.min(1, maxDim / Math.max(img.width, img.height));
-        const c = document.createElement('canvas');
-        c.width = Math.round(img.width * ratio);
-        c.height = Math.round(img.height * ratio);
-        c.getContext('2d')!.drawImage(img, 0, 0, c.width, c.height);
-        processSourceCanvas(c);
-      };
-      img.src = reader.result as string;
-    };
-    reader.readAsDataURL(file);
     e.target.value = '';
+    if (!file) return;
+    setCameraError('');
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      const maxDim = 2000;
+      const ratio = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * ratio);
+      c.height = Math.round(img.height * ratio);
+      c.getContext('2d')!.drawImage(img, 0, 0, c.width, c.height);
+      processSourceCanvas(c);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      setCameraError(
+        lang === 'vi'
+          ? 'Không đọc được định dạng ảnh này. Trên iPhone hãy chọn định dạng JPEG/PNG hoặc chụp trực tiếp.'
+          : 'Could not decode this image format. Please use JPEG/PNG or snap directly with Camera.'
+      );
+    };
+    img.src = objectUrl;
   };
 
   const handleGenerateAndScanSample = () => {
@@ -365,35 +576,133 @@ export const ScannerPanel: React.FC<Props> = ({
       )}
 
       {savedNotice && <div className="toast-success">{savedNotice}</div>}
-      {cameraError && <div className="info-callout warn">{cameraError}</div>}
+      {cameraError && (
+        <div className="info-callout warn" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <span>{cameraError}</span>
+          <button
+            type="button"
+            className="primary-btn"
+            style={{ alignSelf: 'flex-start' }}
+            onClick={() => nativeCameraInputRef.current?.click()}
+          >
+            <Aperture size={17} /> {tr.scan.snapNativeCamera}
+          </button>
+        </div>
+      )}
+
+      <input
+        ref={nativeCameraInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        style={{ display: 'none' }}
+        onChange={handleFileUpload}
+      />
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        style={{ display: 'none' }}
+        onChange={handleFileUpload}
+      />
 
       {!scanResult && (
         <div className="scanner-actions-card">
-          {cameraActive ? (
-            <div className="live-camera-box">
-              <video ref={videoRef} playsInline muted className="live-video" />
+          {/* Keep <video> always mounted in DOM so iOS Safari/WebKit user-gesture priming never races React mount */}
+          <div
+            className="live-camera-box"
+            style={{ display: cameraActive ? 'block' : 'none' }}
+          >
+            <div className="live-video-stage">
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                onPlaying={() => {
+                  setCameraStarting(false);
+                  setNeedsManualPlayTap(false);
+                }}
+                className="live-video"
+              />
               <canvas ref={overlayCanvasRef} className="live-overlay-canvas" />
-              <div className={`corner-pill ${lockedCorners ? 'locked' : ''}`}>
-                {lockedCorners
-                  ? lang === 'vi'
-                    ? '✓ Đã khóa 4 góc phiếu — giữ yên...'
-                    : '✓ 4 corners locked — hold steady...'
-                  : tr.scan.alignHint}
-              </div>
-              <div className="camera-bottom-bar">
-                <button type="button" className="secondary-btn" onClick={stopCamera}>
-                  <CameraOff size={17} /> {tr.scan.stopCamera}
-                </button>
-                <button type="button" className="primary-btn" onClick={captureCurrentVideoFrame}>
-                  <Camera size={17} /> {lang === 'vi' ? 'Chụp ngay' : 'Capture Now'}
-                </button>
-              </div>
+
+              {cameraStarting && !needsManualPlayTap && (
+                <div className="camera-status-overlay">
+                  <span>
+                    {lang === 'vi'
+                      ? 'Đang khởi động ống kính Camera...'
+                      : 'Starting camera lens...'}
+                  </span>
+                </div>
+              )}
+
+              {needsManualPlayTap && (
+                <div className="camera-status-overlay">
+                  <span>
+                    {lang === 'vi'
+                      ? 'Camera đã sẵn sàng — chạm nút bên dưới để hiển thị hình ảnh'
+                      : 'Camera ready — tap below to start live preview'}
+                  </span>
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    onClick={handleManualPlayTap}
+                  >
+                    <Play size={17} />{' '}
+                    {lang === 'vi' ? 'Bật hiển thị Camera' : 'Start Video Feed'}
+                  </button>
+                </div>
+              )}
+
+              {!cameraStarting && !needsManualPlayTap && (
+                <div className={`corner-pill ${lockedCorners ? 'locked' : ''}`}>
+                  {lockedCorners
+                    ? lang === 'vi'
+                      ? '✓ Đã khóa 4 góc phiếu — giữ yên...'
+                      : '✓ 4 corners locked — hold steady...'
+                    : tr.scan.alignHint}
+                </div>
+              )}
             </div>
-          ) : (
+
+            <div className="camera-bottom-bar">
+              <button type="button" className="secondary-btn" onClick={stopCamera}>
+                <CameraOff size={16} /> {tr.scan.stopCamera}
+              </button>
+              <button type="button" className="secondary-btn" onClick={handleFlipCamera}>
+                <RefreshCw size={16} /> {tr.scan.switchCamera}
+              </button>
+              <button
+                type="button"
+                className="primary-btn"
+                disabled={cameraStarting || needsManualPlayTap}
+                onClick={captureCurrentVideoFrame}
+              >
+                <Camera size={17} /> {lang === 'vi' ? 'Chụp ngay' : 'Capture'}
+              </button>
+            </div>
+          </div>
+
+          {!cameraActive && (
             <div className="scan-launch-grid">
-              <button type="button" className="primary-btn big-scan-btn" onClick={startCamera}>
+              <button
+                type="button"
+                className="primary-btn big-scan-btn"
+                onClick={() => startCamera('environment')}
+              >
                 <Camera size={22} />
                 <span>{tr.scan.openCamera}</span>
+              </button>
+
+              <button
+                type="button"
+                className="secondary-btn big-scan-btn"
+                style={{ borderColor: '#0d9488', color: '#0f766e' }}
+                onClick={() => nativeCameraInputRef.current?.click()}
+              >
+                <Aperture size={20} />
+                <span>{tr.scan.snapNativeCamera}</span>
               </button>
 
               <button
@@ -404,13 +713,6 @@ export const ScannerPanel: React.FC<Props> = ({
                 <ImagePlus size={20} />
                 <span>{tr.scan.uploadPhoto}</span>
               </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                style={{ display: 'none' }}
-                onChange={handleFileUpload}
-              />
 
               <button
                 type="button"

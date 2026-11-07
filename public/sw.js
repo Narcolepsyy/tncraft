@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tncraft-pwa-v4';
+const CACHE_NAME = 'tncraft-pwa-v5';
 const RELATIVE_SHELL = [
   './',
   './index.html',
@@ -50,6 +50,27 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET' || !req.url.startsWith(self.location.origin)) return;
 
   const fallbackIndex = new URL('./index.html', self.registration.scope).toString();
+  const isDocOrScript =
+    req.mode === 'navigate' ||
+    req.destination === 'document' ||
+    req.url.endsWith('/index.html');
+
+  // Network-first for HTML navigations so online users immediately receive updates,
+  // falling back to offline cache when disconnected.
+  if (isDocOrScript) {
+    event.respondWith(
+      fetch(req)
+        .then((res) => {
+          if (res && res.status === 200 && res.type === 'basic') {
+            const copy = res.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
+          }
+          return res;
+        })
+        .catch(() => caches.match(req).then((c) => c || caches.match(fallbackIndex)))
+    );
+    return;
+  }
 
   event.respondWith(
     caches.match(req).then((cached) => {

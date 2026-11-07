@@ -522,11 +522,21 @@ textarea {
   background: #000;
 }
 
+.live-video-stage {
+  position: relative;
+  width: 100%;
+  max-width: 480px;
+  min-height: 320px;
+  margin: 0 auto;
+  background: #000;
+}
+
 .live-video {
   width: 100%;
-  max-height: 68dvh;
-  object-fit: cover;
+  height: auto;
+  min-height: 320px;
   display: block;
+  background: #000;
 }
 
 .live-overlay-canvas {
@@ -535,6 +545,22 @@ textarea {
   width: 100%;
   height: 100%;
   pointer-events: none;
+}
+
+.camera-status-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 20px;
+  text-align: center;
+  background: rgba(15, 23, 42, 0.72);
+  color: #f8fafc;
+  font-size: 14px;
+  z-index: 4;
 }
 
 .corner-pill {
