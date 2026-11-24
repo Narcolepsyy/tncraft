@@ -333,5 +333,36 @@ describe.runIf(hasRealData)('Real-World Vietnamese Exam Data Integration (real_d
     expect(lowLightScan.shortAnswers).toEqual(preKeyScan.shortAnswers.slice(0, 4));
     expect(lowLightScan.grade.totalScore).toBe(5.5);
     expect(lowLightScan.grade.warnings).toEqual([]);
+
+    // Step 6: Back-of-Page Essay Writing Bleed-Through Stress Test on Phần III Câu 3
+    // In real exams, students write their Part IV Essay on the back of the 70-80gsm sheet,
+    // causing ~16-26% gray show-through strokes across the intentionally blank columns (cols 1 & 2)
+    // of a 1-digit Part III answer (Câu 3). Verify the engine rejects the back-page bleed-through!
+    const bleedRgba = new Uint8ClampedArray(imgData.data);
+    // Inject synthetic back-page cursive pen bleed-through strokes (~22-28% darkening across partial bubble discs)
+    // in the lower Part III region (specifically crossing Câu 3's empty columns 1 & 2 around y=0.72..0.85, x=0.38..0.52)
+    for (let y = Math.floor(H * 0.68); y < Math.floor(H * 0.90); y++) {
+      for (let x = Math.floor(W * 0.41); x < Math.floor(W * 0.54); x++) {
+        // Cursive sinusoidal handwriting strokes bleeding through from back of sheet
+        const strokeWave = Math.sin(x * 0.23 + y * 0.17) + Math.cos(x * 0.11 - y * 0.29);
+        if (strokeWave > 0.75) {
+          const p = (y * W + x) * 4;
+          // Attenuate paper reflectance by 24% (typical back-of-page ballpoint ink show-through)
+          bleedRgba[p] = Math.round(bleedRgba[p] * 0.76);
+          bleedRgba[p + 1] = Math.round(bleedRgba[p + 1] * 0.76);
+          bleedRgba[p + 2] = Math.round(bleedRgba[p + 2] * 0.76);
+        }
+      }
+    }
+
+    const bleedScan = scanSheetFromImageData(
+      { width: W, height: H, data: bleedRgba, colorSpace: 'srgb' } as ImageData,
+      syncedContest,
+      keys12,
+      { eraseMode: 'normal' }
+    );
+    expect(bleedScan.shortAnswers[2]).toBe('3'); // Must remain 1-digit '3', NOT '331' or '31'
+    expect(bleedScan.shortAnswers).toEqual(['-0,6', '5400', '3', '3,5']);
+    expect(bleedScan.grade.totalScore).toBe(5.5);
   });
 });

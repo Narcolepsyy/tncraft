@@ -715,16 +715,26 @@ function measureCircleFill(
   let haloSum = 0;
   let haloCnt = 0;
 
+  // 4-quadrant accumulators to distinguish a 2D filled bubble disc from a 1D back-page handwriting stroke
+  const qGraySum = [0, 0, 0, 0];
+  const qCnt = [0, 0, 0, 0];
+
   for (let py = minY; py <= maxY; py++) {
-    const dy2 = (py - cy) * (py - cy);
+    const dy = py - cy;
+    const dy2 = dy * dy;
     for (let px = minX; px <= maxX; px++) {
-      const d2 = (px - cx) * (px - cx) + dy2;
+      const dx = px - cx;
+      const d2 = dx * dx + dy2;
       if (d2 <= r2) {
         totalPixels++;
         const idx = py * imgW + px;
+        const g = thresh.gray[idx];
         if (thresh.binary[idx]) darkPixels++;
-        graySum += thresh.gray[idx];
+        graySum += g;
         localSum += thresh.localMean[idx];
+        const qi = (dy > 0 ? 2 : 0) + (dx > 0 ? 1 : 0);
+        qGraySum[qi] += g;
+        qCnt[qi]++;
       } else if (d2 >= haloIn2 && d2 <= haloOut2) {
         haloSum += thresh.gray[py * imgW + px];
         haloCnt++;
@@ -741,14 +751,33 @@ function measureCircleFill(
     45,
     haloCnt >= 8 ? Math.max(baseLocal, haloSum / haloCnt) * 0.6 + baseLocal * 0.4 : baseLocal
   );
-  const relDark = Math.max(0, Math.min(1, 1 - meanGray / paperRef));
-  return binRatio * 0.62 + Math.min(1, relDark * 1.85) * 0.38;
+
+  // 14% show-through dead-zone: back-of-page pen writing bleeding through 70-80gsm paper
+  // attenuates paper brightness by ~12-18%, whereas front-page marks drop brightness by 30-75%.
+  const rawDrop = Math.max(0, 1 - meanGray / paperRef);
+  const relDark = Math.max(0, Math.min(1, (rawDrop - 0.14) / 0.44));
+
+  // Quadrant spatial coverage check: a real shaded bubble darkens >=3 quadrants around the center,
+  // whereas a thin pen stroke from the back page or stray line only crosses 1-2 quadrants.
+  let activeQuads = 0;
+  for (let qi = 0; qi < 4; qi++) {
+    if (qCnt[qi] > 0) {
+      const qMean = qGraySum[qi] / qCnt[qi];
+      if (1 - qMean / paperRef >= 0.16) {
+        activeQuads++;
+      }
+    }
+  }
+  const spatialFactor = activeQuads >= 3 ? 1.0 : activeQuads === 2 ? 0.65 : 0.38;
+
+  return (binRatio * 0.58 + relDark * 0.42) * spatialFactor;
 }
 
 function pickMarkedChoice(
   items: Array<{ value: string; score: number }>,
   eraseMode: 'normal' | 'high',
-  minMarkThreshold = 0.33
+  minMarkThreshold = 0.34,
+  allowFaintRescue = true
 ): { value: string; multi: boolean } {
   const scored = [...items].sort((a, b) => b.score - a.score);
   if (scored.length === 0) return { value: '', multi: false };
@@ -760,14 +789,15 @@ function pickMarkedChoice(
   const medianRest =
     rest.length > 0 ? rest[Math.floor(rest.length / 2)].score : 0;
 
-  // Faint 2B/HB pencil rescue: clearly stands out above clean siblings in the same row/column
+  // Faint 2B/HB pencil rescue: only used when sheet/question doesn't already have strong high-contrast marks
   if (
+    allowFaintRescue &&
     top.score < minMarkThreshold &&
     items.length >= 4 &&
-    top.score >= 0.21 &&
-    medianRest <= 0.12 &&
-    top.score - second.score >= 0.12 &&
-    top.score >= second.score * 1.85
+    top.score >= 0.26 &&
+    medianRest <= 0.10 &&
+    top.score - second.score >= 0.15 &&
+    top.score >= second.score * 2.1
   ) {
     return { value: top.value, multi: false };
   }
@@ -777,7 +807,7 @@ function pickMarkedChoice(
   }
 
   // Reject uniform shadow/noise floor if every sibling bubble in the group is similarly dark
-  if (rest.length >= 2 && medianRest > 0.26 && top.score - medianRest < 0.11) {
+  if (rest.length >= 2 && medianRest > 0.25 && top.score - medianRest < 0.12) {
     return { value: '', multi: false };
   }
 
@@ -790,6 +820,66 @@ function pickMarkedChoice(
   }
 
   return { value: top.value, multi: false };
+}
+
+/**
+ * Decode a 4-column Part III Short Numeric question while rejecting back-of-page pen bleed-through
+ * in intentionally blank columns (e.g. single-digit answer "8" where columns 2-4 have faint show-through).
+ */
+function resolvePart3QuestionColumns(
+  colGroups: Array<Array<{ value: string; score: number }>>,
+  eraseMode: 'normal' | 'high',
+  sheetRefScore: number
+): string[] {
+  const colPeaks = colGroups.map((g) =>
+    g.reduce((max, item) => (item.score > max ? item.score : max), 0)
+  );
+  const questionPeak = Math.max(...colPeaks, 0);
+
+  // Any secondary column in the same question must be at least 48% as dark as the strongest column
+  // in this question AND at least 44% as dark as the student's median mark on the sheet.
+  const effectiveThreshold = Math.max(0.35, sheetRefScore * 0.44, questionPeak * 0.48);
+  const allowFaint = sheetRefScore < 0.45 && questionPeak < 0.48;
+
+  const pickedCols = colGroups.map((group) => {
+    const res = pickMarkedChoice(group, eraseMode, effectiveThreshold, allowFaint);
+    return res.multi ? '?' : res.value || '';
+  });
+
+  // Contiguity enforcement: a valid written number in a 4-column grid cannot have an empty column
+  // sandwiched between filled columns (e.g. col0="8", col1="", col2="1" from back-page bleed).
+  // Keep only the contiguous run of non-empty columns that contains the highest peak score.
+  const nonEmptyIndices = pickedCols
+    .map((v, idx) => (v !== '' ? idx : -1))
+    .filter((idx) => idx >= 0);
+
+  if (nonEmptyIndices.length > 1) {
+    const runs: number[][] = [];
+    for (const idx of nonEmptyIndices) {
+      const lastRun = runs[runs.length - 1];
+      if (!lastRun || idx === lastRun[lastRun.length - 1] + 1) {
+        if (!lastRun) runs.push([idx]);
+        else lastRun.push(idx);
+      } else {
+        runs.push([idx]);
+      }
+    }
+    if (runs.length > 1) {
+      let bestRun = runs[0];
+      let bestRunPeak = -1;
+      for (const run of runs) {
+        const rp = Math.max(...run.map((cIdx) => colPeaks[cIdx]));
+        if (rp > bestRunPeak) {
+          bestRunPeak = rp;
+          bestRun = run;
+        }
+      }
+      const keepSet = new Set(bestRun);
+      return pickedCols.map((v, idx) => (keepSet.has(idx) ? v : ''));
+    }
+  }
+
+  return pickedCols;
 }
 
 /**
@@ -842,10 +932,13 @@ function scanMinistryBgdSheet(
   const normIdRgba = normalizeIlluminationRgba(idRgba, ID_W, ID_H);
   const normBodyRgba = normalizeIlluminationRgba(bodyRgba, BODY_W, BODY_H);
 
-  const idThresh = adaptiveThresholdImage(normIdRgba, ID_W, ID_H, 0.84, 24);
-  const bodyThresh = adaptiveThresholdImage(normBodyRgba, BODY_W, BODY_H, 0.84, 24);
+  // Use 0.79 sensitivity on normalized sheet regions so back-of-page pen show-through (~15% drop)
+  // does not trigger binary ink pixels
+  const idThresh = adaptiveThresholdImage(normIdRgba, ID_W, ID_H, 0.79, 24);
+  const bodyThresh = adaptiveThresholdImage(normBodyRgba, BODY_W, BODY_H, 0.79, 24);
 
   const overlayBubbles: BubbleCoord[] = [];
+  const strongMarkScores: number[] = [];
   // Composite layout: top header 1000x364 + bottom body 1000x1050 = 1000x1414
   const HEADER_H = 364;
   // ID box sits inside header from x=673..1000, y=0..364
@@ -923,6 +1016,10 @@ function scanMinistryBgdSheet(
       group.push({ value: choices[oi], score: sc });
     }
     const res = pickMarkedChoice(group, settings.eraseMode);
+    const topSc = Math.max(...group.map((g) => g.score), 0);
+    if (res.value && res.value !== 'MULTI' && topSc >= 0.42) {
+      strongMarkScores.push(topSc);
+    }
     const picked = (res.value as MCQChoice) || '';
     mcqAnswers.push(picked);
 
@@ -1012,15 +1109,20 @@ function scanMinistryBgdSheet(
     }
   }
 
-  // 5. Decode Part III (Short Numeric up to 6)
+  // 5. Decode Part III (Short Numeric up to 6) with intra-question & sheet-reference bleed rejection
+  const sortedStrong = [...strongMarkScores].sort((a, b) => a - b);
+  const sheetRefScore =
+    sortedStrong.length >= 4 ? sortedStrong[Math.floor(sortedStrong.length / 2)] : 0.65;
+
   const shortAnswers: string[] = [];
   if (contest.enablePart3) {
     const p3Count = Math.min(6, contest.part3Questions);
     const p3ScanLimit = keys.length === 0 ? 6 : p3Count;
     for (let q = 0; q < p3ScanLimit; q++) {
       const qx = 79.0 + q * 150.8;
-      let str = '';
       const qOverlays: typeof overlayBubbles = [];
+      const colGroups: Array<Array<{ value: string; score: number }>> = [];
+
       for (let col = 0; col < 4; col++) {
         const cx = qx + col * 32.6;
         const group: Array<{ value: string; score: number }> = [];
@@ -1079,10 +1181,16 @@ function scanMinistryBgdSheet(
           });
         }
 
-        const res = pickMarkedChoice(group, settings.eraseMode);
-        if (res.multi) str += '?';
-        else if (res.value) str += res.value;
+        colGroups.push(group);
       }
+
+      const resolvedCols = resolvePart3QuestionColumns(
+        colGroups,
+        settings.eraseMode,
+        sheetRefScore
+      );
+      const str = resolvedCols.join('');
+
       if (q < p3Count || str !== '') {
         overlayBubbles.push(...qOverlays);
       }
@@ -1300,16 +1408,21 @@ export function scanSheetFromImageData(
   const shortAnswers: string[] = [];
   if (contest.formId === 'bgd_2025' && contest.enablePart3) {
     for (let q = 0; q < contest.part3Questions; q++) {
-      let str = '';
+      const colGroups: Array<Array<{ value: string; score: number }>> = [];
       for (let col = 0; col < 4; col++) {
         const group = geom.bubbles.filter(
           (b) => b.section === 'short' && b.index === q && b.subIndex === col
         );
-        const res = pickFromGroup(group);
-        if (res.multi) str += '?';
-        else if (res.value) str += res.value;
+        colGroups.push(
+          group.map((b) => ({ value: b.value, score: fillScores.get(b.id) || 0 }))
+        );
       }
-      shortAnswers.push(str);
+      const resolvedCols = resolvePart3QuestionColumns(
+        colGroups,
+        settings.eraseMode,
+        0.55
+      );
+      shortAnswers.push(resolvedCols.join(''));
     }
   }
 
